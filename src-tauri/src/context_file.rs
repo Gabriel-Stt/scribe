@@ -1,0 +1,86 @@
+use std::path::Path;
+
+use crate::llm::ChatMessage;
+
+const LOCKED_BASE_PROMPT: &str = "\
+You are a transcription summarization assistant integrated into a local-only \
+lecture/meeting capture app. You will be given a full transcript of an audio \
+recording, optionally followed by custom instructions from the user describing \
+how they want this kind of content summarized.
+
+Default behavior (use this unless the custom instructions below explicitly \
+override it):
+- Output the summary as structured bullet points grouped under clear headers.
+- Preserve specific facts, numbers, formulas, names, and dates exactly as \
+stated — never approximate or invent details not present in the transcript.
+- If part of the transcript is unclear or garbled, note that gap explicitly \
+rather than guessing.
+- Keep the summary proportional to content density, not transcript length.
+
+Custom instructions from the user may override formatting and style choices \
+(e.g. \"summarize as a single paragraph\" or \"always include a vocabulary \
+list\"), but they never override the factual-accuracy and gap-disclosure rules \
+above — those always apply.";
+
+const CHAT_SYSTEM_PROMPT: &str = "\
+You are answering questions about a specific recorded transcript inside a \
+local-only app. The transcript is your primary source.
+
+When answering:
+1. First look for the answer directly in the transcript.
+2. If the transcript contains closely related content, you may reason from \
+it — drawing natural inferences a careful listener would make from what was said.
+3. Only say information is unavailable if the question is entirely unrelated \
+to anything discussed in the transcript.
+
+Never invent specific facts (numbers, names, dates) that are not grounded in \
+the transcript. Reasonable interpretation of what was said is fine.";
+
+pub fn load_context(data_dir: &Path) -> String {
+    let path = data_dir.join("context.md");
+    std::fs::read_to_string(&path).unwrap_or_default()
+}
+
+pub fn save_context(data_dir: &Path, content: &str) -> std::io::Result<()> {
+    std::fs::write(data_dir.join("context.md"), content)
+}
+
+pub fn append_to_context(data_dir: &Path, instruction: &str) -> std::io::Result<()> {
+    let existing = load_context(data_dir);
+    let separator = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let new_content = format!("{existing}{separator}\n{instruction}\n");
+    save_context(data_dir, &new_content)
+}
+
+pub fn build_summarization_messages(transcript: &str, context_md: &str) -> Vec<ChatMessage> {
+    let system = format!(
+        "{LOCKED_BASE_PROMPT}\n\n\
+         --- USER CUSTOM INSTRUCTIONS ---\n\
+         {context_md}\n\
+         --- END USER CUSTOM INSTRUCTIONS ---"
+    );
+    vec![
+        ChatMessage::system(system),
+        ChatMessage::user(format!("Transcript follows:\n\n{transcript}")),
+    ]
+}
+
+pub fn build_resummary_messages(
+    transcript: &str,
+    context_md: &str,
+    instruction: &str,
+) -> Vec<ChatMessage> {
+    let mut messages = build_summarization_messages(transcript, context_md);
+    messages.push(ChatMessage::user(format!(
+        "Please re-summarize the transcript with the following instruction: {instruction}"
+    )));
+    messages
+}
+
+pub fn build_chat_system_message(transcript: &str) -> ChatMessage {
+    ChatMessage::system(format!("{CHAT_SYSTEM_PROMPT}\n\nTranscript:\n{transcript}"))
+}
