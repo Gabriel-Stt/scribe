@@ -23,48 +23,40 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
-            // Ensure app data dir exists
             let data_dir = app_handle.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
 
-            // Open SQLite DB
             let db_path = data_dir.join("scribe.db");
             let conn = rusqlite::Connection::open(&db_path)?;
             db::init(&conn)?;
 
-            // Spawn parakeet sidecar
             let sidecar_child = spawn_parakeet_sidecar(SIDECAR_DIR, PARAKEET_PORT);
 
-            // Build ASR engine
             let asr: Arc<dyn asr::AsrEngine> =
                 Arc::new(asr::parakeet::ParakeetSidecarEngine::new(PARAKEET_PORT));
 
-            // Build LLM engine and check health asynchronously
             let ollama = Arc::new(llm::openai_compat::OllamaEngine::new(
                 OLLAMA_BASE_URL,
                 OLLAMA_MODEL,
             ));
             let llm: Arc<dyn llm::LlmEngine> = ollama.clone();
-            let llm_error: Mutex<Option<String>> = Mutex::new(None);
-
-            // Check Ollama health in background (non-blocking startup)
-            let ollama_check = ollama.clone();
 
             let state = AppState {
                 asr,
                 llm,
                 db: Mutex::new(conn),
                 sidecar: Mutex::new(sidecar_child.ok()),
-                llm_error,
+                llm_error: Mutex::new(None),
+                current_recording_path: Mutex::new(None),
+                live_stop: Mutex::new(None),
             };
 
             app.manage(state);
             app.manage(audio::spawn_audio_thread());
 
-            // Kick off the Ollama health check; result goes into AppState.llm_error
             let handle2 = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = ollama_check.check_health().await {
+                if let Err(e) = ollama.check_health().await {
                     eprintln!("[scribe] Ollama health check failed: {e}");
                     if let Some(s) = handle2.try_state::<AppState>() {
                         *s.llm_error.lock().unwrap() = Some(e.to_string());
@@ -75,6 +67,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // Phase 1
             commands::get_status,
             commands::start_recording,
             commands::pause_recording,
@@ -87,13 +80,23 @@ pub fn run() {
             commands::save_preference,
             commands::get_context,
             commands::save_context,
+            // Phase 2
+            commands::list_meetings,
+            commands::get_meeting_detail,
+            commands::update_meeting,
+            commands::delete_meeting,
+            commands::restore_summary,
+            commands::add_manual_note,
+            commands::export_meeting_markdown,
         ])
         .build(tauri::generate_context!())
         .expect("error building Tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
-                // Kill sidecar on exit
                 if let Some(state) = app_handle.try_state::<AppState>() {
+                    if let Some(tx) = state.live_stop.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
                     if let Ok(mut child_guard) = state.sidecar.lock() {
                         if let Some(ref mut child) = *child_guard {
                             let _ = child.kill();
@@ -108,7 +111,6 @@ fn spawn_parakeet_sidecar(
     sidecar_dir: &str,
     port: u16,
 ) -> std::io::Result<std::process::Child> {
-    // Build a PATH that includes Homebrew and user-local bins where uv/ffmpeg live
     let mut path = String::from("/opt/homebrew/bin:/usr/local/bin");
     if let Ok(home) = std::env::var("HOME") {
         path.push(':');
@@ -119,7 +121,6 @@ fn spawn_parakeet_sidecar(
         path.push_str(&existing);
     }
 
-    // Find uv
     let uv_bin = find_executable(&["uv"], &path).unwrap_or_else(|| "uv".to_string());
 
     eprintln!("[scribe] launching sidecar: {uv_bin} run python main.py --port {port}");
