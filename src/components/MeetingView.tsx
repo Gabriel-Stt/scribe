@@ -5,9 +5,10 @@ import {
   MeetingDetail,
   SummaryVersionItem,
   StoredChatMessage,
-  SUBJECT_TAGS,
+  Folder,
+  UserTag,
 } from "../lib/types";
-import { formatTime, Spinner, MarkdownBody, SubjectPill } from "./shared";
+import { formatTime, Spinner, MarkdownBody } from "./shared";
 
 type Tab = "summary" | "transcript" | "chat";
 
@@ -28,9 +29,11 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
 
   // Summary
   const [currentSummary, setCurrentSummary] = useState("");
+  const [activeSummaryVersion, setActiveSummaryVersion] = useState<number | null>(null);
   const [showVersions, setShowVersions] = useState(false);
   const [resummaryInput, setResummaryInput] = useState("");
   const [summaryBusy, setSummaryBusy] = useState(false);
+  const [copiedSummary, setCopiedSummary] = useState(false);
 
   // Chat
   const [chatHistory, setChatHistory] = useState<StoredChatMessage[]>([]);
@@ -38,6 +41,10 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   const [streamingContent, setStreamingContent] = useState<string | null>(null);
   const [chatBusy, setChatBusy] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // Folders & tags
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [userTags, setUserTags] = useState<UserTag[]>([]);
 
   // Export
   const [exportBusy, setExportBusy] = useState(false);
@@ -48,8 +55,12 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
     try {
       const d = await invoke<MeetingDetail>("get_meeting_detail", { meetingId });
       setDetail(d);
-      const latest = d.summaries[0]?.content ?? "";
-      setCurrentSummary(latest);
+      const activeVer = d.active_summary_version;
+      setActiveSummaryVersion(activeVer);
+      const activeSummary = activeVer != null
+        ? (d.summaries.find((s) => s.version === activeVer)?.content ?? d.summaries[0]?.content ?? "")
+        : (d.summaries[0]?.content ?? "");
+      setCurrentSummary(activeSummary);
       setChatHistory(d.chat_messages as StoredChatMessage[]);
       setTitleDraft(d.title);
     } catch (e) {
@@ -67,7 +78,20 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
     setStreamingContent(null);
   }, [loadDetail]);
 
-  // Listen for auto-generated title updates
+  useEffect(() => {
+    invoke<Folder[]>("list_folders").then(setFolders).catch(() => {});
+    invoke<UserTag[]>("list_tags").then(setUserTags).catch(() => {});
+  }, []);
+
+  // Listen for folder/tag changes from sidebar
+  useEffect(() => {
+    const handler = () => {
+      invoke<Folder[]>("list_folders").then(setFolders).catch(() => {});
+    };
+    window.addEventListener("scribe:reload-meetings", handler);
+    return () => window.removeEventListener("scribe:reload-meetings", handler);
+  }, []);
+
   useEffect(() => {
     const unsub = listen<[string, string]>("meeting-title-ready", (e) => {
       const [id, title] = e.payload;
@@ -94,13 +118,24 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
     window.dispatchEvent(new Event("scribe:reload-meetings"));
   }
 
-  // ---- Subject tag ----
+  // ---- Tag ----
 
-  async function handleSubjectChange(tag: string) {
+  async function handleTagChange(tag: string) {
     await invoke("update_meeting", {
       args: { id: meetingId, title: null, subject_tag: tag },
     });
     setDetail((d) => d ? { ...d, subject_tag: tag || null } : d);
+    window.dispatchEvent(new Event("scribe:reload-meetings"));
+  }
+
+  // ---- Folder ----
+
+  async function handleFolderChange(folderId: string) {
+    await invoke("assign_meeting_folder", {
+      meetingId,
+      folderId: folderId || null,
+    });
+    setDetail((d) => d ? { ...d, folder_id: folderId || null } : d);
     window.dispatchEvent(new Event("scribe:reload-meetings"));
   }
 
@@ -115,9 +150,9 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
       });
       setCurrentSummary(newSummary);
       setResummaryInput("");
-      // Refresh summaries list
       const d = await invoke<MeetingDetail>("get_meeting_detail", { meetingId });
       setDetail(d);
+      setActiveSummaryVersion(d.active_summary_version);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -128,19 +163,26 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   async function handleRestoreVersion(v: SummaryVersionItem) {
     setSummaryBusy(true);
     try {
-      const content = await invoke<string>("restore_summary", {
+      await invoke<string>("restore_summary", {
         meetingId,
         version: v.version,
       });
-      setCurrentSummary(content);
+      setCurrentSummary(v.content);
+      setActiveSummaryVersion(v.version);
       setShowVersions(false);
-      const d = await invoke<MeetingDetail>("get_meeting_detail", { meetingId });
-      setDetail(d);
     } catch (e) {
       setError(String(e));
     } finally {
       setSummaryBusy(false);
     }
+  }
+
+  async function handleCopySummary() {
+    try {
+      await navigator.clipboard.writeText(currentSummary);
+      setCopiedSummary(true);
+      setTimeout(() => setCopiedSummary(false), 2000);
+    } catch { /* ignore */ }
   }
 
   // ---- Chat ----
@@ -221,7 +263,6 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   }
 
   const sortedTranscript = [...detail.segments].sort((a, b) => a.start - b.start);
-  // Interleave notes into transcript for display
   type TranscriptEntry =
     | { kind: "segment"; start: number; end: number; text: string }
     | { kind: "note"; elapsed_seconds: number; text: string };
@@ -234,6 +275,9 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
     const tb = b.kind === "segment" ? b.start : b.elapsed_seconds;
     return ta - tb;
   });
+
+  const activeFolder = folders.find((f) => f.id === detail.folder_id);
+  const activeTag = userTags.find((t) => t.name === detail.subject_tag);
 
   return (
     <div className="flex flex-col h-full">
@@ -250,35 +294,79 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
               className="w-full bg-gray-800 border border-indigo-500 rounded px-2 py-1 text-base font-semibold text-white focus:outline-none"
             />
           ) : (
-            <h1
-              className="text-base font-semibold text-white cursor-text hover:text-indigo-300 transition-colors truncate"
-              title="Click to edit title"
-              onClick={() => setEditingTitle(true)}
-            >
-              {detail.title}
-            </h1>
+            <div className="flex items-center gap-2">
+              <h1
+                className="text-base font-semibold text-white cursor-text hover:text-indigo-300 transition-colors truncate"
+                title="Click to rename"
+                onClick={() => setEditingTitle(true)}
+              >
+                {detail.title}
+              </h1>
+              <button
+                onClick={() => setEditingTitle(true)}
+                className="shrink-0 text-gray-600 hover:text-gray-400 transition-colors"
+                title="Rename"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                </svg>
+              </button>
+            </div>
           )}
-          <div className="flex items-center gap-3 mt-1">
+          <div className="flex items-center gap-3 mt-1 flex-wrap">
             <span className="text-xs text-gray-600">{formatDateLong(detail.created_at)}</span>
             {detail.duration_seconds != null && (
               <span className="text-xs text-gray-700">{formatTime(detail.duration_seconds)}</span>
             )}
-            <SubjectPill tag={detail.subject_tag} />
+            {activeFolder && (
+              <span
+                className="text-xs px-2 py-0.5 rounded-full font-medium flex items-center gap-1"
+                style={{ background: activeFolder.color + "33", color: activeFolder.color }}
+              >
+                <span className="w-1.5 h-1.5 rounded-sm" style={{ background: activeFolder.color }} />
+                {activeFolder.name}
+              </span>
+            )}
+            {detail.subject_tag && (
+              <span
+                className="text-xs px-2 py-0.5 rounded-full font-medium"
+                style={activeTag
+                  ? { background: activeTag.color + "33", color: activeTag.color }
+                  : { background: "#374151", color: "#9ca3af" }
+                }
+              >
+                {detail.subject_tag}
+              </span>
+            )}
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
-          {/* Subject tag selector */}
+        <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+          {/* Folder selector */}
           <select
-            value={detail.subject_tag ?? ""}
-            onChange={(e) => handleSubjectChange(e.target.value)}
-            className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1 text-xs text-gray-300 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            value={detail.folder_id ?? ""}
+            onChange={(e) => handleFolderChange(e.target.value)}
+            className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1 text-xs text-gray-300 focus:outline-none focus:ring-1 focus:ring-indigo-500 max-w-[110px]"
           >
-            <option value="">No tag</option>
-            {SUBJECT_TAGS.map((t) => (
-              <option key={t} value={t}>{t}</option>
+            <option value="">No folder</option>
+            {folders.map((f) => (
+              <option key={f.id} value={f.id}>{f.name}</option>
             ))}
           </select>
+
+          {/* Tag selector */}
+          <select
+            value={detail.subject_tag ?? ""}
+            onChange={(e) => handleTagChange(e.target.value)}
+            className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1 text-xs text-gray-300 focus:outline-none focus:ring-1 focus:ring-indigo-500 max-w-[110px]"
+          >
+            <option value="">No tag</option>
+            {userTags.map((t) => (
+              <option key={t.id} value={t.name}>{t.name}</option>
+            ))}
+          </select>
+
           <button
             onClick={handleExport}
             disabled={exportBusy}
@@ -332,11 +420,38 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
 
       {/* Tab content */}
       <div className="flex-1 overflow-y-auto p-6">
+
         {/* ----- Summary ----- */}
         {tab === "summary" && (
           <div className="space-y-4">
             {currentSummary ? (
-              <MarkdownBody>{currentSummary}</MarkdownBody>
+              <>
+                <div className="flex justify-end">
+                  <button
+                    onClick={handleCopySummary}
+                    className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1.5 transition-colors"
+                    title="Copy summary to clipboard"
+                  >
+                    {copiedSummary ? (
+                      <>
+                        <svg className="w-3.5 h-3.5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                        </svg>
+                        <span className="text-emerald-400">Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
+                            d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                        </svg>
+                        Copy
+                      </>
+                    )}
+                  </button>
+                </div>
+                <MarkdownBody>{currentSummary}</MarkdownBody>
+              </>
             ) : (
               <p className="text-sm text-gray-600 italic">No summary yet.</p>
             )}
@@ -384,28 +499,33 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
                 </button>
                 {showVersions && (
                   <div className="mt-3 space-y-3">
-                    {detail.summaries.map((sv) => (
-                      <div
-                        key={sv.version}
-                        className="bg-gray-900 border border-gray-800 rounded-lg p-3"
-                      >
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="text-xs text-gray-600">v{sv.version} · {formatDateLong(sv.created_at)}</span>
-                          {sv.content !== currentSummary && (
-                            <button
-                              onClick={() => handleRestoreVersion(sv)}
-                              className="text-xs text-indigo-400 hover:text-indigo-300"
-                            >
-                              Restore
-                            </button>
-                          )}
-                          {sv.content === currentSummary && (
-                            <span className="text-xs text-emerald-600">Current</span>
-                          )}
+                    {detail.summaries.map((sv) => {
+                      // If no active version tracked, treat the highest version (first in DESC list) as active
+                      const effectiveActive = activeSummaryVersion ?? detail.summaries[0]?.version ?? null;
+                      const isActive = sv.version === effectiveActive;
+                      return (
+                        <div
+                          key={sv.version}
+                          className={`bg-gray-900 border rounded-lg p-3 ${isActive ? "border-indigo-600/50" : "border-gray-800"}`}
+                        >
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-xs text-gray-600">v{sv.version} · {formatDateLong(sv.created_at)}</span>
+                            {isActive ? (
+                              <span className="text-xs text-emerald-500">Current</span>
+                            ) : (
+                              <button
+                                onClick={() => handleRestoreVersion(sv)}
+                                disabled={summaryBusy}
+                                className="text-xs text-indigo-400 hover:text-indigo-300 disabled:opacity-40"
+                              >
+                                Restore
+                              </button>
+                            )}
+                          </div>
+                          <p className="text-xs text-gray-500 line-clamp-3">{sv.content}</p>
                         </div>
-                        <p className="text-xs text-gray-500 line-clamp-3">{sv.content}</p>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>

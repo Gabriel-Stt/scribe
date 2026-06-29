@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AppView } from "./lib/types";
 import Sidebar from "./components/Sidebar";
 import RecordView from "./components/RecordView";
@@ -7,6 +7,13 @@ import SettingsView from "./components/SettingsView";
 
 export default function App() {
   const [view, setView] = useState<AppView>({ kind: "home" });
+
+  // Disable the native browser/webview context menu (removes "Inspect Element" etc.)
+  useEffect(() => {
+    const handler = (e: MouseEvent) => e.preventDefault();
+    document.addEventListener("contextmenu", handler);
+    return () => document.removeEventListener("contextmenu", handler);
+  }, []);
 
   function handleMeetingReady(id: string) {
     setView({ kind: "meeting", id });

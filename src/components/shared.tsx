@@ -54,22 +54,3 @@ export function MarkdownBody({ children }: { children: string }) {
     </div>
   );
 }
-
-export function SubjectPill({ tag }: { tag: string | null }) {
-  if (!tag) return null;
-  const colors: Record<string, string> = {
-    Chemistry: "bg-emerald-900/60 text-emerald-300",
-    History: "bg-amber-900/60 text-amber-300",
-    Business: "bg-blue-900/60 text-blue-300",
-    Portuguese: "bg-purple-900/60 text-purple-300",
-    MUN: "bg-indigo-900/60 text-indigo-300",
-    Math: "bg-cyan-900/60 text-cyan-300",
-    Physics: "bg-orange-900/60 text-orange-300",
-    Biology: "bg-lime-900/60 text-lime-300",
-    English: "bg-pink-900/60 text-pink-300",
-  };
-  const cls = colors[tag] ?? "bg-gray-700 text-gray-300";
-  return (
-    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${cls}`}>{tag}</span>
-  );
-}

@@ -19,9 +19,7 @@ pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
     pub sidecar: Mutex<Option<std::process::Child>>,
     pub llm_error: Mutex<Option<String>>,
-    /// Path of the WAV file currently being recorded (set by start_recording, cleared by stop_recording)
     pub current_recording_path: Mutex<Option<PathBuf>>,
-    /// Oneshot sender to cancel the live-transcription background task
     pub live_stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -41,9 +39,6 @@ fn map_err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// Patch a WAV file's RIFF/data chunk sizes to match its current on-disk length.
-/// Hound leaves these as 0 until finalize(); we fix them so parakeet can read
-/// a snapshot of the file while recording is still in progress.
 fn fix_wav_header(path: &std::path::Path) -> Result<()> {
     let file_len = std::fs::metadata(path)?.len();
     if file_len < 44 {
@@ -96,10 +91,8 @@ pub async fn start_recording(
 
     audio.start(path.clone()).await.map_err(map_err)?;
 
-    // Stash the recording path so the live-transcription task can find it
     *state.current_recording_path.lock().unwrap() = Some(path.clone());
 
-    // Spawn background live-transcription task
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     *state.live_stop.lock().unwrap() = Some(stop_tx);
 
@@ -116,7 +109,6 @@ pub async fn start_recording(
                 _ = &mut stop_rx => break,
             }
 
-            // Get the current recording path from managed state
             let src = {
                 let s = app2.state::<AppState>();
                 let p = s.current_recording_path.lock().unwrap().clone();
@@ -124,7 +116,6 @@ pub async fn start_recording(
             };
             let Some(src) = src else { break };
 
-            // Copy + fix header
             let tmp = src.with_extension("snap.wav");
             if std::fs::copy(&src, &tmp).is_err() {
                 continue;
@@ -134,7 +125,6 @@ pub async fn start_recording(
                 continue;
             }
 
-            // Transcribe the snapshot; emit only genuinely new segments
             if let Ok(tx) = asr.transcribe(&tmp).await {
                 for seg in &tx.segments {
                     if seg.end > last_end_time + 0.1 {
@@ -166,7 +156,6 @@ pub async fn stop_recording(
     state: State<'_, AppState>,
     audio: State<'_, AudioHandle>,
 ) -> Result<String, String> {
-    // Cancel live-transcription task
     if let Some(tx) = state.live_stop.lock().unwrap().take() {
         let _ = tx.send(());
     }
@@ -193,8 +182,6 @@ pub async fn transcribe_audio(
         .await
         .map_err(map_err)?;
 
-    // Emit the definitive segments so the UI can show the final transcript
-    // as it "types in" — the frontend replaces any live-segment preview with these
     for seg in &transcript.segments {
         let _ = app.emit("transcript-segment", seg);
     }
@@ -227,7 +214,6 @@ pub async fn create_meeting(
     let meeting_id = uuid::Uuid::new_v4().to_string();
     let full_text = args.transcript.full_text.clone();
 
-    // Persist meeting and transcript segments
     {
         let conn = state.db.lock().unwrap();
         db::insert_meeting(
@@ -249,13 +235,11 @@ pub async fn create_meeting(
         db::insert_transcript_segments(&conn, &meeting_id, &segs).map_err(map_err)?;
     }
 
-    // Generate summary
     let summary =
         generate_summary_inner(&app, &state, &meeting_id, &full_text, None)
             .await
             .map_err(map_err)?;
 
-    // Auto-generate title in the background; emits "meeting-title-ready" when done
     let llm = state.llm.clone();
     let mid = meeting_id.clone();
     let excerpt = full_text.chars().take(2000).collect::<String>();
@@ -296,6 +280,7 @@ async fn generate_summary_inner(
         let conn = state.db.lock().unwrap();
         let v = db::next_summary_version(&conn, meeting_id)?;
         db::insert_summary(&conn, meeting_id, v, &summary)?;
+        // insert_summary already updates active_summary_version
     }
 
     Ok(summary)
@@ -331,6 +316,7 @@ pub struct MeetingListItem {
     pub id: String,
     pub title: String,
     pub subject_tag: Option<String>,
+    pub folder_id: Option<String>,
     pub created_at: String,
     pub duration_seconds: Option<f64>,
 }
@@ -339,15 +325,17 @@ pub struct MeetingListItem {
 pub async fn list_meetings(
     state: State<'_, AppState>,
     search: Option<String>,
+    folder_id: Option<String>,
 ) -> Result<Vec<MeetingListItem>, String> {
     let conn = state.db.lock().unwrap();
-    let rows = db::list_meetings(&conn, search.as_deref()).map_err(map_err)?;
+    let rows = db::list_meetings(&conn, search.as_deref(), folder_id.as_deref()).map_err(map_err)?;
     Ok(rows
         .into_iter()
         .map(|r| MeetingListItem {
             id: r.id,
             title: r.title,
             subject_tag: r.subject_tag,
+            folder_id: r.folder_id,
             created_at: r.created_at,
             duration_seconds: r.duration_seconds,
         })
@@ -386,9 +374,11 @@ pub struct MeetingDetail {
     pub id: String,
     pub title: String,
     pub subject_tag: Option<String>,
+    pub folder_id: Option<String>,
     pub created_at: String,
     pub duration_seconds: Option<f64>,
     pub audio_path: Option<String>,
+    pub active_summary_version: Option<i64>,
     pub segments: Vec<TranscriptSegmentItem>,
     pub notes: Vec<NoteItem>,
     pub summaries: Vec<SummaryVersionItem>,
@@ -438,9 +428,11 @@ pub async fn get_meeting_detail(
         id: row.id,
         title: row.title,
         subject_tag: row.subject_tag,
+        folder_id: row.folder_id,
         created_at: row.created_at,
         duration_seconds: row.duration_seconds,
         audio_path: row.audio_path,
+        active_summary_version: row.active_summary_version,
         segments,
         notes,
         summaries,
@@ -452,7 +444,7 @@ pub async fn get_meeting_detail(
 pub struct UpdateMeetingArgs {
     pub id: String,
     pub title: Option<String>,
-    pub subject_tag: Option<String>, // use "" to clear
+    pub subject_tag: Option<String>,
 }
 
 #[tauri::command]
@@ -472,6 +464,16 @@ pub async fn update_meeting(
 }
 
 #[tauri::command]
+pub async fn assign_meeting_folder(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    folder_id: Option<String>,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::update_meeting_folder(&conn, &meeting_id, folder_id.as_deref()).map_err(map_err)
+}
+
+#[tauri::command]
 pub async fn delete_meeting(
     state: State<'_, AppState>,
     meeting_id: String,
@@ -484,29 +486,22 @@ pub async fn delete_meeting(
 
 #[tauri::command]
 pub async fn restore_summary(
-    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
     version: i64,
 ) -> Result<String, String> {
-    let content = {
-        let conn = state.db.lock().unwrap();
-        db::get_summaries(&conn, &meeting_id)
-            .map_err(map_err)?
-            .into_iter()
-            .find(|s| s.version == version)
-            .map(|s| s.content)
-            .ok_or_else(|| "Summary version not found".to_string())?
-    };
+    let conn = state.db.lock().unwrap();
 
-    // Save as a new (latest) version rather than mutating history
-    {
-        let conn = state.db.lock().unwrap();
-        let v = db::next_summary_version(&conn, &meeting_id).map_err(map_err)?;
-        db::insert_summary(&conn, &meeting_id, v, &content).map_err(map_err)?;
-    }
+    let content = db::get_summaries(&conn, &meeting_id)
+        .map_err(map_err)?
+        .into_iter()
+        .find(|s| s.version == version)
+        .map(|s| s.content)
+        .ok_or_else(|| "Summary version not found".to_string())?;
 
-    let _ = app.emit("summary-restored", (&meeting_id, &content));
+    // Just update the active version pointer — no new row created
+    db::set_active_summary_version(&conn, &meeting_id, version).map_err(map_err)?;
+
     Ok(content)
 }
 
@@ -543,7 +538,13 @@ pub async fn export_meeting_markdown(
         .ok_or_else(|| "Meeting not found".to_string())?;
 
     let summaries = db::get_summaries(&conn, &meeting_id).map_err(map_err)?;
-    let latest_summary = summaries.first().map(|s| s.content.as_str());
+    let active_version = row.active_summary_version;
+    let latest_summary = if let Some(av) = active_version {
+        summaries.iter().find(|s| s.version == av).map(|s| s.content.as_str())
+            .or_else(|| summaries.first().map(|s| s.content.as_str()))
+    } else {
+        summaries.first().map(|s| s.content.as_str())
+    };
 
     let segments_raw = db::get_transcript_segments(&conn, &meeting_id).map_err(map_err)?;
     let segments: Vec<(f64, f64, &str)> = segments_raw
@@ -646,4 +647,112 @@ pub async fn get_context(app: AppHandle) -> Result<String, String> {
 pub async fn save_context(app: AppHandle, content: String) -> Result<(), String> {
     let data_dir = data_dir(&app).map_err(map_err)?;
     context_file::save_context(&data_dir, &content).map_err(map_err)
+}
+
+// ---- Folders ---------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct FolderItem {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    pub created_at: String,
+}
+
+#[tauri::command]
+pub async fn list_folders(state: State<'_, AppState>) -> Result<Vec<FolderItem>, String> {
+    let conn = state.db.lock().unwrap();
+    db::list_folders(&conn)
+        .map_err(map_err)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| FolderItem { id: r.id, name: r.name, color: r.color, created_at: r.created_at })
+                .collect()
+        })
+}
+
+#[derive(Deserialize)]
+pub struct CreateFolderArgs {
+    pub name: String,
+    pub color: String,
+}
+
+#[tauri::command]
+pub async fn create_folder(
+    state: State<'_, AppState>,
+    args: CreateFolderArgs,
+) -> Result<FolderItem, String> {
+    let conn = state.db.lock().unwrap();
+    let row = db::insert_folder(&conn, &args.name, &args.color).map_err(map_err)?;
+    Ok(FolderItem { id: row.id, name: row.name, color: row.color, created_at: row.created_at })
+}
+
+#[tauri::command]
+pub async fn delete_folder(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::delete_folder(&conn, &folder_id).map_err(map_err)
+}
+
+#[derive(Deserialize)]
+pub struct RenameFolderArgs {
+    pub id: String,
+    pub name: String,
+}
+
+#[tauri::command]
+pub async fn rename_folder(
+    state: State<'_, AppState>,
+    args: RenameFolderArgs,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::rename_folder(&conn, &args.id, &args.name).map_err(map_err)
+}
+
+// ---- User tags -------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct UserTagItem {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+}
+
+#[tauri::command]
+pub async fn list_tags(state: State<'_, AppState>) -> Result<Vec<UserTagItem>, String> {
+    let conn = state.db.lock().unwrap();
+    db::list_user_tags(&conn)
+        .map_err(map_err)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| UserTagItem { id: r.id, name: r.name, color: r.color })
+                .collect()
+        })
+}
+
+#[derive(Deserialize)]
+pub struct CreateTagArgs {
+    pub name: String,
+    pub color: String,
+}
+
+#[tauri::command]
+pub async fn create_tag(
+    state: State<'_, AppState>,
+    args: CreateTagArgs,
+) -> Result<UserTagItem, String> {
+    let conn = state.db.lock().unwrap();
+    let row = db::insert_user_tag(&conn, &args.name, &args.color).map_err(map_err)?;
+    Ok(UserTagItem { id: row.id, name: row.name, color: row.color })
+}
+
+#[tauri::command]
+pub async fn delete_tag(
+    state: State<'_, AppState>,
+    tag_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::delete_user_tag(&conn, &tag_id).map_err(map_err)
 }

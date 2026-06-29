@@ -88,6 +88,16 @@ pub fn run() {
             commands::restore_summary,
             commands::add_manual_note,
             commands::export_meeting_markdown,
+            // Folders
+            commands::list_folders,
+            commands::create_folder,
+            commands::delete_folder,
+            commands::rename_folder,
+            commands::assign_meeting_folder,
+            // Tags
+            commands::list_tags,
+            commands::create_tag,
+            commands::delete_tag,
         ])
         .build(tauri::generate_context!())
         .expect("error building Tauri application")

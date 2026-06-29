@@ -26,10 +26,24 @@ export interface ChatMessage {
   content: string;
 }
 
+export interface Folder {
+  id: string;
+  name: string;
+  color: string;
+  created_at: string;
+}
+
+export interface UserTag {
+  id: string;
+  name: string;
+  color: string;
+}
+
 export interface MeetingListItem {
   id: string;
   title: string;
   subject_tag: string | null;
+  folder_id: string | null;
   created_at: string;
   duration_seconds: number | null;
 }
@@ -55,27 +69,16 @@ export interface MeetingDetail {
   id: string;
   title: string;
   subject_tag: string | null;
+  folder_id: string | null;
   created_at: string;
   duration_seconds: number | null;
   audio_path: string | null;
+  active_summary_version: number | null;
   segments: TranscriptSegment[];
   notes: NoteItem[];
   summaries: SummaryVersionItem[];
   chat_messages: StoredChatMessage[];
 }
-
-export const SUBJECT_TAGS = [
-  "Chemistry",
-  "History",
-  "Business",
-  "Portuguese",
-  "MUN",
-  "Math",
-  "Physics",
-  "Biology",
-  "English",
-  "Other",
-];
 
 export type AppView =
   | { kind: "home" }
