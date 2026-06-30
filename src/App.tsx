@@ -73,7 +73,7 @@ export default function App() {
       case "trash":
         return <TrashView />;
       case "note":
-        return <NoteDetailView noteId={view.id} onDeleted={() => setView({ kind: "home" })} />;
+        return <NoteDetailView noteId={view.id} onDeleted={() => setView({ kind: "home" })} onNavigate={setView} />;
       default:
         return <HomeHint onRecord={() => setView({ kind: "record" })} />;
     }

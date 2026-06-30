@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { NoteFile, Folder, LinkedMeeting, MeetingListItem } from "../lib/types";
+import { NoteFile, Folder, LinkedMeeting, MeetingListItem, AppView } from "../lib/types";
 import NoteEditor from "./NoteEditor";
 
 function formatDate(iso: string): string {
@@ -23,9 +23,10 @@ function formatDate(iso: string): string {
 interface Props {
   noteId: string;
   onDeleted: () => void;
+  onNavigate: (view: AppView) => void;
 }
 
-export default function NoteDetailView({ noteId, onDeleted }: Props) {
+export default function NoteDetailView({ noteId, onDeleted, onNavigate }: Props) {
   const [note, setNote] = useState<NoteFile | null>(null);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [titleDraft, setTitleDraft] = useState("");
@@ -230,9 +231,9 @@ export default function NoteDetailView({ noteId, onDeleted }: Props) {
         </div>
 
         {/* Linked meetings sidebar */}
-        <div className="w-52 shrink-0 border-l border-gray-800 flex flex-col px-3 py-4 gap-3 overflow-y-auto">
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] text-gray-600 uppercase tracking-widest font-medium">Linked Meetings</span>
+        <div className="w-48 shrink-0 border-l border-gray-800 flex flex-col py-4 overflow-hidden">
+          <div className="flex items-center justify-between px-3 mb-2">
+            <span className="text-[10px] text-gray-600 uppercase tracking-widest font-medium">Meetings</span>
             <div className="relative" ref={linkMeetingPickerRef}>
               <button
                 onClick={() => setShowLinkMeetingPicker((v) => !v)}
@@ -240,7 +241,7 @@ export default function NoteDetailView({ noteId, onDeleted }: Props) {
                 className="w-5 h-5 rounded text-gray-600 hover:text-indigo-400 flex items-center justify-center transition-colors text-sm leading-none"
               >+</button>
               {showLinkMeetingPicker && (
-                <div className="absolute right-0 top-full mt-1 z-20 bg-gray-800 border border-gray-700 rounded-lg shadow-xl py-1 min-w-[200px] max-h-48 overflow-y-auto">
+                <div className="absolute right-0 top-full mt-1 z-20 bg-gray-800 border border-gray-700 rounded-lg shadow-xl py-1 w-56 max-h-48 overflow-y-auto">
                   {allMeetings.filter((m) => !linkedMeetings.some((l) => l.id === m.id)).length === 0 ? (
                     <p className="px-3 py-2 text-xs text-gray-600">No meetings to link</p>
                   ) : (
@@ -250,7 +251,7 @@ export default function NoteDetailView({ noteId, onDeleted }: Props) {
                         <button
                           key={m.id}
                           onClick={() => handleLinkMeeting(m.id)}
-                          className="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700 truncate"
+                          className="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700 truncate block"
                         >
                           {m.title}
                         </button>
@@ -261,28 +262,29 @@ export default function NoteDetailView({ noteId, onDeleted }: Props) {
             </div>
           </div>
 
-          {linkedMeetings.length === 0 ? (
-            <p className="text-[11px] text-gray-700 italic leading-snug">No meetings linked yet.</p>
-          ) : (
-            <div className="space-y-2">
-              {linkedMeetings.map((m) => (
-                <div key={m.id} className="group flex items-start gap-1.5">
-                  <svg className="w-3 h-3 text-gray-600 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
-                      d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                  </svg>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs text-gray-300 leading-snug line-clamp-2">{m.title}</p>
-                    <p className="text-[10px] text-gray-600 mt-0.5">{formatDate(m.created_at)}</p>
+          <div className="flex-1 overflow-y-auto px-2">
+            {linkedMeetings.length === 0 ? (
+              <p className="text-[11px] text-gray-700 italic leading-snug px-1">No meetings linked yet.</p>
+            ) : (
+              <div className="space-y-1">
+                {linkedMeetings.map((m) => (
+                  <div key={m.id} className="group relative rounded-lg hover:bg-gray-800/60 transition-colors">
+                    <button
+                      onClick={() => onNavigate({ kind: "meeting", id: m.id })}
+                      className="w-full text-left px-2 py-2 pr-6"
+                    >
+                      <p className="text-xs text-gray-300 leading-snug truncate">{m.title}</p>
+                      <p className="text-[10px] text-gray-600 mt-0.5">{formatDate(m.created_at)}</p>
+                    </button>
+                    <button
+                      onClick={() => handleUnlinkMeeting(m.id)}
+                      className="absolute right-1.5 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 text-xs transition-opacity"
+                    >✕</button>
                   </div>
-                  <button
-                    onClick={() => handleUnlinkMeeting(m.id)}
-                    className="opacity-0 group-hover:opacity-100 text-gray-700 hover:text-red-400 text-xs transition-opacity shrink-0 mt-0.5"
-                  >✕</button>
-                </div>
-              ))}
-            </div>
-          )}
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

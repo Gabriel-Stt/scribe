@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Transcript, TranscriptSegment, StatusResponse, MeetingResult, AppView } from "../lib/types";
+import { Transcript, TranscriptSegment, StatusResponse, MeetingResult, AppView, Folder } from "../lib/types";
 import { formatTime, Spinner, StatusDot } from "./shared";
 
 interface RecordViewProps {
@@ -23,11 +23,29 @@ export default function RecordView({ onMeetingReady }: RecordViewProps) {
   const [meetingId, setMeetingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
+  const [showFolderPicker, setShowFolderPicker] = useState(false);
+  const folderPickerRef = useRef<HTMLDivElement>(null);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedRef = useRef(0);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const levelPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    invoke<Folder[]>("list_folders").then(setFolders).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!showFolderPicker) return;
+    const h = (e: MouseEvent) => {
+      if (folderPickerRef.current && !folderPickerRef.current.contains(e.target as Node))
+        setShowFolderPicker(false);
+    };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, [showFolderPicker]);
 
   // Status polling
   const pollStatus = useCallback(async () => {
@@ -181,6 +199,9 @@ export default function RecordView({ onMeetingReady }: RecordViewProps) {
         });
       }
 
+      if (selectedFolderId) {
+        await invoke("update_meeting_folder", { meetingId: result.meeting_id, folderId: selectedFolderId });
+      }
       setMeetingId(result.meeting_id);
       setPhase("done");
       window.dispatchEvent(new Event("scribe:reload-meetings"));
@@ -201,6 +222,9 @@ export default function RecordView({ onMeetingReady }: RecordViewProps) {
 
       setPhase("transcribing");
       const result = await invoke<MeetingResult>("import_audio_file", { path: selected });
+      if (selectedFolderId) {
+        await invoke("update_meeting_folder", { meetingId: result.meeting_id, folderId: selectedFolderId });
+      }
       setMeetingId(result.meeting_id);
       setPhase("done");
       window.dispatchEvent(new Event("scribe:reload-meetings"));
@@ -294,6 +318,52 @@ export default function RecordView({ onMeetingReady }: RecordViewProps) {
                 >
                   ↑ Import File
                 </button>
+
+                {/* Folder picker */}
+                <div className="relative ml-auto" ref={folderPickerRef}>
+                  {(() => {
+                    const active = folders.find((f) => f.id === selectedFolderId);
+                    return (
+                      <button
+                        onClick={() => setShowFolderPicker((v) => !v)}
+                        className="flex items-center gap-1.5 text-xs rounded-full border border-gray-700 px-3 py-1.5 hover:border-gray-500 transition-colors"
+                        style={active ? { borderColor: active.color + "66", color: active.color } : { color: "#6b7280" }}
+                      >
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                            d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
+                        </svg>
+                        {active ? active.name : "No folder"}
+                        <svg className="w-3 h-3 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                        </svg>
+                      </button>
+                    );
+                  })()}
+                  {showFolderPicker && (
+                    <div className="absolute right-0 top-full mt-1 z-20 bg-gray-800 border border-gray-700 rounded-lg shadow-xl py-1 min-w-[160px]">
+                      <button
+                        onClick={() => { setSelectedFolderId(null); setShowFolderPicker(false); }}
+                        className="w-full text-left px-3 py-1.5 text-xs text-gray-400 hover:bg-gray-700"
+                      >
+                        No folder
+                      </button>
+                      {folders.map((f) => (
+                        <button
+                          key={f.id}
+                          onClick={() => { setSelectedFolderId(f.id); setShowFolderPicker(false); }}
+                          className="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700 flex items-center gap-2"
+                        >
+                          <span className="w-2 h-2 rounded-sm shrink-0" style={{ background: f.color }} />
+                          {f.name}
+                        </button>
+                      ))}
+                      {folders.length === 0 && (
+                        <p className="px-3 py-2 text-xs text-gray-600">No folders yet</p>
+                      )}
+                    </div>
+                  )}
+                </div>
               </>
             )}
             {isRecording && (

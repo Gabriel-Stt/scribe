@@ -266,6 +266,24 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
     } catch { /* ignore */ }
   }
 
+  const [sendToNoteBusy, setSendToNoteBusy] = useState(false);
+  const [sentToNote, setSentToNote] = useState(false);
+
+  async function handleSendToNote() {
+    if (!currentSummary || sendToNoteBusy) return;
+    setSendToNoteBusy(true);
+    try {
+      const note = await invoke<NoteFile>("create_note");
+      const title = detail ? `Summary — ${detail.title}` : "Meeting Summary";
+      const html = `<p>${currentSummary.replace(/\n/g, "</p><p>")}</p>`;
+      await invoke("save_note", { args: { note_id: note.id, title, content: html } });
+      window.dispatchEvent(new Event("scribe:reload-notes"));
+      setSentToNote(true);
+      setTimeout(() => setSentToNote(false), 2000);
+    } catch { /* ignore */ }
+    finally { setSendToNoteBusy(false); }
+  }
+
   // ---- Chat ----
 
   async function handleChat() {
@@ -674,7 +692,33 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
           <div className="space-y-4">
             {currentSummary ? (
               <>
-                <div className="flex justify-end no-print">
+                <div className="flex justify-end items-center gap-3 no-print">
+                  {/* Send to note */}
+                  <button
+                    onClick={handleSendToNote}
+                    disabled={sendToNoteBusy}
+                    className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1.5 transition-colors disabled:opacity-40"
+                    title="Create a new note with this summary"
+                  >
+                    {sentToNote ? (
+                      <>
+                        <svg className="w-3.5 h-3.5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                        </svg>
+                        <span className="text-emerald-400">Sent!</span>
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
+                            d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                        Send to note
+                      </>
+                    )}
+                  </button>
+
+                  {/* Copy */}
                   <button
                     onClick={handleCopySummary}
                     className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1.5 transition-colors"
