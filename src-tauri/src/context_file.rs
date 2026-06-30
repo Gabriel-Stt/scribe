@@ -97,6 +97,39 @@ pub fn build_title_messages(transcript_excerpt: &str) -> Vec<ChatMessage> {
     ]
 }
 
+fn html_to_plain_text(html: &str) -> String {
+    let html = html.replace("</p>", "\n");
+    let html = html.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n");
+    let html = html.replace("</h1>", "\n").replace("</h2>", "\n").replace("</h3>", "\n");
+    let html = html.replace("</li>", "\n");
+    let html = html.replace("</blockquote>", "\n");
+    let html = html.replace("</div>", "\n");
+
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&nbsp;", " ");
+
+    out.split('\n')
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn build_markdown_export(
     title: &str,
     subject: Option<&str>,
@@ -105,6 +138,7 @@ pub fn build_markdown_export(
     summary: Option<&str>,
     segments: &[(f64, f64, &str)],
     notes: &[(f64, &str)],
+    rich_notes: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {title}\n\n"));
@@ -137,11 +171,20 @@ pub fn build_markdown_export(
     }
 
     if !notes.is_empty() {
-        out.push_str("## Notes\n\n");
+        out.push_str("## Live Notes\n\n");
         for (elapsed, text) in notes {
             let m = (*elapsed / 60.0) as u32;
             let s = (*elapsed % 60.0) as u32;
             out.push_str(&format!("**{m}:{s:02}** — {text}\n\n"));
+        }
+    }
+
+    if let Some(rich) = rich_notes.filter(|s| !s.is_empty() && *s != "<p></p>") {
+        let plain = html_to_plain_text(rich);
+        if !plain.is_empty() {
+            out.push_str("## Notes\n\n");
+            out.push_str(&plain);
+            out.push_str("\n\n");
         }
     }
 

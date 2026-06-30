@@ -1,5 +1,5 @@
 use std::io::{Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -35,6 +35,16 @@ fn recordings_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn recordings_dir_resolved(data: &Path, conn: &rusqlite::Connection) -> Result<PathBuf> {
+    let custom = db::get_setting(conn, "recordings_dir").ok().flatten();
+    let dir = match custom.as_deref().filter(|s| !s.is_empty()) {
+        Some(p) => PathBuf::from(p),
+        None => data.join("recordings"),
+    };
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 fn map_err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -52,6 +62,79 @@ fn fix_wav_header(path: &std::path::Path) -> Result<()> {
     f.write_all(&riff_size)?;
     f.seek(SeekFrom::Start(40))?;
     f.write_all(&data_size)?;
+    Ok(())
+}
+
+// ---- App Settings -----------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+pub struct AppSettings {
+    pub auto_delete_audio: bool,
+    pub recordings_dir: Option<String>,
+    pub selected_device: Option<String>,
+    pub sort_by: String,
+    pub default_tag: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_app_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    let conn = state.db.lock().unwrap();
+    Ok(AppSettings {
+        auto_delete_audio: db::get_setting(&conn, "auto_delete_audio")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true"),
+        recordings_dir: db::get_setting(&conn, "recordings_dir")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty()),
+        selected_device: db::get_setting(&conn, "selected_device")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty()),
+        sort_by: db::get_setting(&conn, "sort_by")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "date_desc".to_string()),
+        default_tag: db::get_setting(&conn, "default_tag")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty()),
+    })
+}
+
+#[tauri::command]
+pub async fn save_app_settings(
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::set_setting(
+        &conn,
+        "auto_delete_audio",
+        if settings.auto_delete_audio { "true" } else { "false" },
+    )
+    .map_err(map_err)?;
+    db::set_setting(
+        &conn,
+        "recordings_dir",
+        settings.recordings_dir.as_deref().unwrap_or(""),
+    )
+    .map_err(map_err)?;
+    db::set_setting(
+        &conn,
+        "selected_device",
+        settings.selected_device.as_deref().unwrap_or(""),
+    )
+    .map_err(map_err)?;
+    db::set_setting(&conn, "sort_by", &settings.sort_by).map_err(map_err)?;
+    db::set_setting(
+        &conn,
+        "default_tag",
+        settings.default_tag.as_deref().unwrap_or(""),
+    )
+    .map_err(map_err)?;
     Ok(())
 }
 
@@ -85,11 +168,21 @@ pub async fn start_recording(
     state: State<'_, AppState>,
     audio: State<'_, AudioHandle>,
 ) -> Result<(), String> {
-    let dir = recordings_dir(&app).map_err(map_err)?;
+    let data = data_dir(&app).map_err(map_err)?;
+    let (dir, device_name) = {
+        let conn = state.db.lock().unwrap();
+        let dir = recordings_dir_resolved(&data, &conn).map_err(map_err)?;
+        let device_name = db::get_setting(&conn, "selected_device")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+        (dir, device_name)
+    };
+
     let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
     let path = dir.join(format!("{timestamp}.wav"));
 
-    audio.start(path.clone()).await.map_err(map_err)?;
+    audio.start(path.clone(), device_name).await.map_err(map_err)?;
 
     *state.current_recording_path.lock().unwrap() = Some(path.clone());
 
@@ -163,6 +256,18 @@ pub async fn stop_recording(
 
     let path = audio.stop().await.map_err(map_err)?;
     Ok(path.to_string_lossy().to_string())
+}
+
+// ---- Audio devices / level --------------------------------------------------
+
+#[tauri::command]
+pub async fn list_audio_devices(audio: State<'_, AudioHandle>) -> Result<Vec<String>, String> {
+    Ok(audio.list_devices().await)
+}
+
+#[tauri::command]
+pub async fn get_audio_level(audio: State<'_, AudioHandle>) -> Result<f32, String> {
+    Ok(audio.get_level())
 }
 
 // ---- Transcription ---------------------------------------------------------
@@ -240,6 +345,19 @@ pub async fn create_meeting(
             .await
             .map_err(map_err)?;
 
+    // Auto-delete audio if enabled
+    {
+        let conn = state.db.lock().unwrap();
+        let auto_delete = db::get_setting(&conn, "auto_delete_audio")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true");
+        if auto_delete && !args.audio_path.is_empty() {
+            let _ = std::fs::remove_file(&args.audio_path);
+        }
+    }
+
     let llm = state.llm.clone();
     let mid = meeting_id.clone();
     let excerpt = full_text.chars().take(2000).collect::<String>();
@@ -309,16 +427,112 @@ pub async fn resummmarize(
         .map_err(map_err)
 }
 
+// ---- Import audio file -----------------------------------------------------
+
+#[tauri::command]
+pub async fn import_audio_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<MeetingResult, String> {
+    if !state.asr.is_ready().await {
+        return Err("ASR model is still loading. Please wait.".to_string());
+    }
+
+    let src = std::path::PathBuf::from(&path);
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // Convert to WAV if needed
+    let (wav_path, is_temp) = if ext == "wav" {
+        (src.clone(), false)
+    } else {
+        let data = data_dir(&app).map_err(map_err)?;
+        let out = data
+            .join("recordings")
+            .join(format!("import_{}.wav", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(out.parent().unwrap()).map_err(map_err)?;
+        let out_str = out.to_string_lossy().to_string();
+        let status = tokio::process::Command::new("ffmpeg")
+            .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+            .args(["-i", &path, "-ar", "16000", "-ac", "1", "-y", &out_str])
+            .status()
+            .await
+            .map_err(|e| format!("ffmpeg not found ({e}). Install with: brew install ffmpeg"))?;
+        if !status.success() {
+            return Err(
+                "Audio conversion failed. Make sure ffmpeg is installed.".to_string(),
+            );
+        }
+        (out, true)
+    };
+
+    let transcript = state.asr.transcribe(&wav_path).await.map_err(map_err)?;
+    let full_text = transcript.full_text.clone();
+    let duration = transcript.segments.last().map(|s| s.end);
+
+    if is_temp {
+        let _ = std::fs::remove_file(&wav_path);
+    }
+
+    let file_name = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Import");
+    let title = format!("Import — {}", file_name);
+    let meeting_id = uuid::Uuid::new_v4().to_string();
+
+    {
+        let conn = state.db.lock().unwrap();
+        db::insert_meeting(&conn, &meeting_id, &title, &path, &full_text, duration)
+            .map_err(map_err)?;
+        let segs: Vec<(f64, f64, &str)> = transcript
+            .segments
+            .iter()
+            .map(|s| (s.start, s.end, s.text.as_str()))
+            .collect();
+        db::insert_transcript_segments(&conn, &meeting_id, &segs).map_err(map_err)?;
+    }
+
+    let summary =
+        generate_summary_inner(&app, &state, &meeting_id, &full_text, None)
+            .await
+            .map_err(map_err)?;
+
+    let llm = state.llm.clone();
+    let mid = meeting_id.clone();
+    let excerpt = full_text.chars().take(2000).collect::<String>();
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let msgs = context_file::build_title_messages(&excerpt);
+        if let Ok(t) = llm.chat(msgs).await {
+            let t = t.trim().trim_matches('"').to_string();
+            let s = app2.state::<AppState>();
+            let conn = s.db.lock().unwrap();
+            let _ = db::update_meeting_title(&conn, &mid, &t);
+            drop(conn);
+            let _ = app2.emit("meeting-title-ready", (&mid, &t));
+        }
+    });
+
+    Ok(MeetingResult { meeting_id, summary })
+}
+
 // ---- Phase 2: Meetings list & detail ---------------------------------------
 
 #[derive(Serialize)]
 pub struct MeetingListItem {
     pub id: String,
     pub title: String,
-    pub subject_tag: Option<String>,
     pub folder_id: Option<String>,
     pub created_at: String,
     pub duration_seconds: Option<f64>,
+    pub is_pinned: bool,
+    pub deleted_at: Option<String>,
+    pub tags: Vec<UserTagItem>,
 }
 
 #[tauri::command]
@@ -326,18 +540,36 @@ pub async fn list_meetings(
     state: State<'_, AppState>,
     search: Option<String>,
     folder_id: Option<String>,
+    sort_by: Option<String>,
 ) -> Result<Vec<MeetingListItem>, String> {
     let conn = state.db.lock().unwrap();
-    let rows = db::list_meetings(&conn, search.as_deref(), folder_id.as_deref()).map_err(map_err)?;
+    let rows = db::list_meetings(
+        &conn,
+        search.as_deref(),
+        folder_id.as_deref(),
+        sort_by.as_deref().unwrap_or("date_desc"),
+    )
+    .map_err(map_err)?;
+    let mut tag_map = db::get_all_meeting_tags(&conn).map_err(map_err)?;
     Ok(rows
         .into_iter()
-        .map(|r| MeetingListItem {
-            id: r.id,
-            title: r.title,
-            subject_tag: r.subject_tag,
-            folder_id: r.folder_id,
-            created_at: r.created_at,
-            duration_seconds: r.duration_seconds,
+        .map(|r| {
+            let tags = tag_map
+                .remove(&r.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| UserTagItem { id: t.id, name: t.name, color: t.color })
+                .collect();
+            MeetingListItem {
+                id: r.id,
+                title: r.title,
+                folder_id: r.folder_id,
+                created_at: r.created_at,
+                duration_seconds: r.duration_seconds,
+                is_pinned: r.is_pinned,
+                deleted_at: r.deleted_at,
+                tags,
+            }
         })
         .collect())
 }
@@ -373,16 +605,18 @@ pub struct StoredChatMessage {
 pub struct MeetingDetail {
     pub id: String,
     pub title: String,
-    pub subject_tag: Option<String>,
     pub folder_id: Option<String>,
     pub created_at: String,
     pub duration_seconds: Option<f64>,
     pub audio_path: Option<String>,
     pub active_summary_version: Option<i64>,
+    pub is_pinned: bool,
     pub segments: Vec<TranscriptSegmentItem>,
     pub notes: Vec<NoteItem>,
     pub summaries: Vec<SummaryVersionItem>,
     pub chat_messages: Vec<StoredChatMessage>,
+    pub tags: Vec<UserTagItem>,
+    pub notes_content: Option<String>,
 }
 
 #[tauri::command]
@@ -424,19 +658,29 @@ pub async fn get_meeting_detail(
         .map(|(role, content)| StoredChatMessage { role, content })
         .collect();
 
+    let tags = db::get_meeting_tags(&conn, &meeting_id)
+        .map_err(map_err)?
+        .into_iter()
+        .map(|t| UserTagItem { id: t.id, name: t.name, color: t.color })
+        .collect();
+
+    let notes_content = db::get_notes_content(&conn, &meeting_id).map_err(map_err)?;
+
     Ok(MeetingDetail {
         id: row.id,
         title: row.title,
-        subject_tag: row.subject_tag,
         folder_id: row.folder_id,
         created_at: row.created_at,
         duration_seconds: row.duration_seconds,
         audio_path: row.audio_path,
         active_summary_version: row.active_summary_version,
+        is_pinned: row.is_pinned,
         segments,
         notes,
         summaries,
         chat_messages,
+        tags,
+        notes_content,
     })
 }
 
@@ -444,7 +688,6 @@ pub async fn get_meeting_detail(
 pub struct UpdateMeetingArgs {
     pub id: String,
     pub title: Option<String>,
-    pub subject_tag: Option<String>,
 }
 
 #[tauri::command]
@@ -455,10 +698,6 @@ pub async fn update_meeting(
     let conn = state.db.lock().unwrap();
     if let Some(title) = &args.title {
         db::update_meeting_title(&conn, &args.id, title).map_err(map_err)?;
-    }
-    if let Some(tag) = &args.subject_tag {
-        let tag_opt = if tag.is_empty() { None } else { Some(tag.as_str()) };
-        db::update_meeting_subject(&conn, &args.id, tag_opt).map_err(map_err)?;
     }
     Ok(())
 }
@@ -480,6 +719,80 @@ pub async fn delete_meeting(
 ) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     db::delete_meeting(&conn, &meeting_id).map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn list_trashed_meetings(
+    state: State<'_, AppState>,
+) -> Result<Vec<MeetingListItem>, String> {
+    let conn = state.db.lock().unwrap();
+    let rows = db::list_trashed_meetings(&conn).map_err(map_err)?;
+    let mut tag_map = db::get_all_meeting_tags(&conn).map_err(map_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let tags = tag_map
+                .remove(&r.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| UserTagItem { id: t.id, name: t.name, color: t.color })
+                .collect();
+            MeetingListItem {
+                id: r.id,
+                title: r.title,
+                folder_id: r.folder_id,
+                created_at: r.created_at,
+                duration_seconds: r.duration_seconds,
+                is_pinned: r.is_pinned,
+                deleted_at: r.deleted_at,
+                tags,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn restore_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::restore_meeting(&conn, &meeting_id).map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn permanently_delete_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<(), String> {
+    let audio_path = {
+        let conn = state.db.lock().unwrap();
+        db::permanently_delete_meeting(&conn, &meeting_id).map_err(map_err)?
+    };
+    if let Some(path) = audio_path {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toggle_pin_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::toggle_pin_meeting(&conn, &meeting_id, pinned).map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn set_meeting_color(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    color: Option<String>,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::set_meeting_color(&conn, &meeting_id, color.as_deref()).map_err(map_err)
 }
 
 // ---- Summary version history -----------------------------------------------
@@ -524,6 +837,94 @@ pub async fn add_manual_note(
         .map_err(map_err)
 }
 
+// ---- Standalone notes ------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct NoteFileItem {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub folder_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn note_item(r: db::NoteFileRow) -> NoteFileItem {
+    NoteFileItem { id: r.id, title: r.title, content: r.content, folder_id: r.folder_id, created_at: r.created_at, updated_at: r.updated_at }
+}
+
+#[tauri::command]
+pub async fn list_notes(
+    state: State<'_, AppState>,
+    search: Option<String>,
+    folder_id: Option<String>,
+) -> Result<Vec<NoteFileItem>, String> {
+    let conn = state.db.lock().unwrap();
+    let rows = db::list_note_files(&conn, search.as_deref(), folder_id.as_deref()).map_err(map_err)?;
+    Ok(rows.into_iter().map(note_item).collect())
+}
+
+#[tauri::command]
+pub async fn get_note(state: State<'_, AppState>, note_id: String) -> Result<Option<NoteFileItem>, String> {
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_note_file(&conn, &note_id).map_err(map_err)?.map(note_item))
+}
+
+#[tauri::command]
+pub async fn create_note(state: State<'_, AppState>) -> Result<NoteFileItem, String> {
+    let conn = state.db.lock().unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let row = db::insert_note_file(&conn, &id).map_err(map_err)?;
+    Ok(note_item(row))
+}
+
+#[tauri::command]
+pub async fn assign_note_folder(
+    state: State<'_, AppState>,
+    note_id: String,
+    folder_id: Option<String>,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::update_note_file_folder(&conn, &note_id, folder_id.as_deref()).map_err(map_err)
+}
+
+#[derive(Deserialize)]
+pub struct SaveNoteArgs {
+    pub note_id: String,
+    pub title: Option<String>,
+    pub content: Option<String>,
+}
+
+#[tauri::command]
+pub async fn save_note(state: State<'_, AppState>, args: SaveNoteArgs) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    if let Some(t) = &args.title {
+        db::update_note_file_title(&conn, &args.note_id, t).map_err(map_err)?;
+    }
+    if let Some(c) = &args.content {
+        db::update_note_file_content(&conn, &args.note_id, c).map_err(map_err)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_note(state: State<'_, AppState>, note_id: String) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::delete_note_file(&conn, &note_id).map_err(map_err)
+}
+
+// ---- Rich notes (per-meeting) ----------------------------------------------
+
+#[tauri::command]
+pub async fn save_meeting_notes(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    content: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::save_notes_content(&conn, &meeting_id, &content).map_err(map_err)
+}
+
 // ---- Export ----------------------------------------------------------------
 
 #[tauri::command]
@@ -558,14 +959,21 @@ pub async fn export_meeting_markdown(
         .map(|n| (n.elapsed_seconds, n.text.as_str()))
         .collect();
 
+    let tags = db::get_meeting_tags(&conn, &meeting_id).map_err(map_err)?;
+    let tags_str = tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ");
+    let subject = if tags_str.is_empty() { None } else { Some(tags_str.as_str()) };
+
+    let rich_notes = db::get_notes_content(&conn, &meeting_id).map_err(map_err)?;
+
     let md = context_file::build_markdown_export(
         &row.title,
-        row.subject_tag.as_deref(),
+        subject,
         &row.created_at,
         row.duration_seconds,
         latest_summary,
         &segments,
         &notes,
+        rich_notes.as_deref(),
     );
 
     Ok(md)
@@ -755,4 +1163,20 @@ pub async fn delete_tag(
 ) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     db::delete_user_tag(&conn, &tag_id).map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn set_meeting_tags(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    tag_ids: Vec<String>,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::set_meeting_tags(&conn, &meeting_id, &tag_ids).map_err(map_err)
+}
+
+// Suppress unused warning for the original helper (kept for reference)
+#[allow(dead_code)]
+fn _recordings_dir_orig(app: &AppHandle) -> Result<PathBuf> {
+    recordings_dir(app)
 }

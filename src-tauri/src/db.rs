@@ -8,6 +8,25 @@ pub fn init(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute_batch("ALTER TABLE meetings ADD COLUMN folder_id TEXT;");
     let _ = conn.execute_batch("ALTER TABLE meetings ADD COLUMN active_summary_version INTEGER;");
+    let _ = conn.execute_batch("ALTER TABLE meetings ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0;");
+    let _ = conn.execute_batch("ALTER TABLE meetings ADD COLUMN color TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE meetings ADD COLUMN deleted_at TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE meetings ADD COLUMN notes_content TEXT;");
+    // Standalone notes table (idempotent via CREATE IF NOT EXISTS)
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS notes (
+             id         TEXT PRIMARY KEY,
+             title      TEXT NOT NULL DEFAULT 'Untitled Note',
+             content    TEXT NOT NULL DEFAULT '',
+             folder_id  TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );"
+    );
+    let _ = conn.execute_batch("ALTER TABLE notes ADD COLUMN folder_id TEXT;");
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    );
 
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
@@ -22,7 +41,9 @@ pub fn init(conn: &Connection) -> Result<()> {
              audio_path  TEXT,
              full_text   TEXT NOT NULL DEFAULT '',
              folder_id   TEXT,
-             active_summary_version INTEGER
+             active_summary_version INTEGER,
+             is_pinned   INTEGER NOT NULL DEFAULT 0,
+             color       TEXT
          );
 
          CREATE TABLE IF NOT EXISTS transcript_segments (
@@ -73,8 +94,52 @@ pub fn init(conn: &Connection) -> Result<()> {
              name       TEXT NOT NULL UNIQUE,
              color      TEXT NOT NULL DEFAULT '#6b7280',
              created_at TEXT NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS settings (
+             key   TEXT PRIMARY KEY,
+             value TEXT NOT NULL
          );",
     )?;
+
+    // meeting_tags join table (many-to-many, idempotent)
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meeting_tags (
+             meeting_id TEXT NOT NULL,
+             tag_id     TEXT NOT NULL,
+             PRIMARY KEY (meeting_id, tag_id),
+             FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
+             FOREIGN KEY (tag_id)     REFERENCES user_tags(id) ON DELETE CASCADE
+         );"
+    )?;
+
+    // Migrate any existing subject_tag string → meeting_tags rows (idempotent)
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO meeting_tags (meeting_id, tag_id)
+         SELECT m.id, ut.id
+         FROM meetings m
+         JOIN user_tags ut ON ut.name = m.subject_tag
+         WHERE m.subject_tag IS NOT NULL;"
+    )?;
+
+    // Seed preset IB tags (idempotent via UNIQUE name constraint)
+    let presets = [
+        ("HL",         "#8b5cf6"),
+        ("SL",         "#3b82f6"),
+        ("Paper 1",    "#22c55e"),
+        ("Paper 2",    "#f97316"),
+        ("Paper 3",    "#ef4444"),
+        ("Past Paper", "#ec4899"),
+        ("Review",     "#14b8a6"),
+    ];
+    for (name, color) in &presets {
+        let id = uuid::Uuid::new_v4().to_string();
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO user_tags (id, name, color, created_at) VALUES (?1, ?2, ?3, datetime('now'))",
+            params![id, name, color],
+        );
+    }
+
     Ok(())
 }
 
@@ -216,6 +281,9 @@ pub struct MeetingRow {
     pub duration_seconds: Option<f64>,
     pub audio_path: Option<String>,
     pub active_summary_version: Option<i64>,
+    pub is_pinned: bool,
+    pub color: Option<String>,
+    pub deleted_at: Option<String>,
 }
 
 pub struct SummaryRow {
@@ -243,51 +311,66 @@ pub struct UserTagRow {
     pub color: String,
 }
 
+fn sort_clause(sort_by: &str) -> &'static str {
+    match sort_by {
+        "date_asc" => "ORDER BY is_pinned DESC, created_at ASC",
+        "duration_desc" => "ORDER BY is_pinned DESC, duration_seconds DESC NULLS LAST",
+        "duration_asc" => "ORDER BY is_pinned DESC, duration_seconds ASC NULLS LAST",
+        "title_asc" => "ORDER BY is_pinned DESC, title ASC",
+        "title_desc" => "ORDER BY is_pinned DESC, title DESC",
+        _ => "ORDER BY is_pinned DESC, created_at DESC",
+    }
+}
+
 pub fn list_meetings(
     conn: &Connection,
     search: Option<&str>,
     folder_id: Option<&str>,
+    sort_by: &str,
 ) -> Result<Vec<MeetingRow>> {
     let pattern = search
         .filter(|s| !s.is_empty())
         .map(|q| format!("%{q}%"));
 
+    let order = sort_clause(sort_by);
+
     let rows: Vec<MeetingRow> = match (pattern.as_deref(), folder_id) {
         (Some(p), Some(fid)) => {
-            let mut stmt = conn.prepare(
-                "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version
-                 FROM meetings WHERE folder_id = ?1 AND (title LIKE ?2 OR full_text LIKE ?2)
-                 ORDER BY created_at DESC",
-            )?;
+            let sql = format!(
+                "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version, is_pinned, color, deleted_at \
+                 FROM meetings WHERE deleted_at IS NULL AND folder_id = ?1 AND (title LIKE ?2 OR full_text LIKE ?2) {order}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let r = stmt.query_map(params![fid, p], row_to_meeting)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             r
         }
         (Some(p), None) => {
-            let mut stmt = conn.prepare(
-                "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version
-                 FROM meetings WHERE title LIKE ?1 OR full_text LIKE ?1
-                 ORDER BY created_at DESC",
-            )?;
+            let sql = format!(
+                "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version, is_pinned, color, deleted_at \
+                 FROM meetings WHERE deleted_at IS NULL AND (title LIKE ?1 OR full_text LIKE ?1) {order}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let r = stmt.query_map(params![p], row_to_meeting)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             r
         }
         (None, Some(fid)) => {
-            let mut stmt = conn.prepare(
-                "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version
-                 FROM meetings WHERE folder_id = ?1
-                 ORDER BY created_at DESC",
-            )?;
+            let sql = format!(
+                "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version, is_pinned, color, deleted_at \
+                 FROM meetings WHERE deleted_at IS NULL AND folder_id = ?1 {order}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let r = stmt.query_map(params![fid], row_to_meeting)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             r
         }
         (None, None) => {
-            let mut stmt = conn.prepare(
-                "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version
-                 FROM meetings ORDER BY created_at DESC",
-            )?;
+            let sql = format!(
+                "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version, is_pinned, color, deleted_at \
+                 FROM meetings WHERE deleted_at IS NULL {order}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let r = stmt.query_map([], row_to_meeting)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             r
@@ -306,12 +389,15 @@ fn row_to_meeting(row: &rusqlite::Row<'_>) -> rusqlite::Result<MeetingRow> {
         audio_path: row.get(5)?,
         folder_id: row.get(6)?,
         active_summary_version: row.get(7)?,
+        is_pinned: row.get::<_, i64>(8)? != 0,
+        color: row.get(9)?,
+        deleted_at: row.get(10)?,
     })
 }
 
 pub fn get_meeting(conn: &Connection, id: &str) -> Result<Option<MeetingRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version
+        "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version, is_pinned, color, deleted_at
          FROM meetings WHERE id = ?1",
     )?;
     let result = stmt.query_row(params![id], row_to_meeting).optional()?;
@@ -413,11 +499,70 @@ pub fn update_meeting_duration(conn: &Connection, id: &str, duration: f64) -> Re
 }
 
 pub fn delete_meeting(conn: &Connection, id: &str) -> Result<()> {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "UPDATE meetings SET deleted_at = ?1 WHERE id = ?2",
+        params![now, id],
+    )?;
+    Ok(())
+}
+
+pub fn list_trashed_meetings(conn: &Connection) -> Result<Vec<MeetingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, subject_tag, created_at, duration_seconds, audio_path, folder_id, active_summary_version, is_pinned, color, deleted_at \
+         FROM meetings WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC",
+    )?;
+    let rows = stmt.query_map([], row_to_meeting)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn restore_meeting(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE meetings SET deleted_at = NULL WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+pub fn permanently_delete_meeting(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let audio_path: Option<String> = conn
+        .query_row("SELECT audio_path FROM meetings WHERE id = ?1", params![id], |r| r.get(0))
+        .optional()?;
     conn.execute("DELETE FROM chat_messages WHERE meeting_id = ?1", params![id])?;
     conn.execute("DELETE FROM summaries WHERE meeting_id = ?1", params![id])?;
     conn.execute("DELETE FROM manual_notes WHERE meeting_id = ?1", params![id])?;
     conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?1", params![id])?;
     conn.execute("DELETE FROM meetings WHERE id = ?1", params![id])?;
+    Ok(audio_path)
+}
+
+pub fn toggle_pin_meeting(conn: &Connection, id: &str, pinned: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE meetings SET is_pinned = ?1 WHERE id = ?2",
+        params![pinned as i64, id],
+    )?;
+    Ok(())
+}
+
+pub fn set_meeting_color(conn: &Connection, id: &str, color: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE meetings SET color = ?1 WHERE id = ?2",
+        params![color, id],
+    )?;
+    Ok(())
+}
+
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
+    let result = stmt.query_row(params![key], |row| row.get(0)).optional()?;
+    Ok(result)
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        params![key, value],
+    )?;
     Ok(())
 }
 
@@ -489,18 +634,193 @@ pub fn list_user_tags(conn: &Connection) -> Result<Vec<UserTagRow>> {
 }
 
 pub fn delete_user_tag(conn: &Connection, id: &str) -> Result<()> {
-    // Get tag name first, then clear it from meetings
-    let name: Option<String> = conn.query_row(
-        "SELECT name FROM user_tags WHERE id = ?1",
-        params![id],
-        |row| row.get(0),
-    ).optional()?;
-    if let Some(n) = name {
-        conn.execute(
-            "UPDATE meetings SET subject_tag = NULL WHERE subject_tag = ?1",
-            params![n],
-        )?;
-    }
+    conn.execute("DELETE FROM meeting_tags WHERE tag_id = ?1", params![id])?;
     conn.execute("DELETE FROM user_tags WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+pub fn set_meeting_tags(conn: &Connection, meeting_id: &str, tag_ids: &[String]) -> Result<()> {
+    conn.execute("DELETE FROM meeting_tags WHERE meeting_id = ?1", params![meeting_id])?;
+    for tag_id in tag_ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO meeting_tags (meeting_id, tag_id) VALUES (?1, ?2)",
+            params![meeting_id, tag_id],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn get_meeting_tags(conn: &Connection, meeting_id: &str) -> Result<Vec<UserTagRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT ut.id, ut.name, ut.color FROM user_tags ut
+         JOIN meeting_tags mt ON mt.tag_id = ut.id
+         WHERE mt.meeting_id = ?1
+         ORDER BY ut.created_at ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![meeting_id], |row| {
+            Ok(UserTagRow { id: row.get(0)?, name: row.get(1)?, color: row.get(2)? })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+// --- Standalone notes ---
+
+pub struct NoteFileRow {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub folder_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn map_note_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteFileRow> {
+    Ok(NoteFileRow {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        content: row.get(2)?,
+        folder_id: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+pub fn insert_note_file(conn: &Connection, id: &str) -> Result<NoteFileRow> {
+    conn.execute(
+        "INSERT INTO notes (id, title, content, created_at, updated_at)
+         VALUES (?1, 'Untitled Note', '', datetime('now'), datetime('now'))",
+        params![id],
+    )?;
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    Ok(NoteFileRow {
+        id: id.to_string(),
+        title: "Untitled Note".to_string(),
+        content: String::new(),
+        folder_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+pub fn get_note_file(conn: &Connection, id: &str) -> Result<Option<NoteFileRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, content, folder_id, created_at, updated_at FROM notes WHERE id = ?1",
+    )?;
+    Ok(stmt.query_row(params![id], map_note_row).optional()?)
+}
+
+pub fn list_note_files(
+    conn: &Connection,
+    search: Option<&str>,
+    folder_id: Option<&str>,
+) -> Result<Vec<NoteFileRow>> {
+    let pattern = search.filter(|s| !s.is_empty()).map(|q| format!("%{q}%"));
+    let rows: Vec<NoteFileRow> = match (pattern.as_deref(), folder_id) {
+        (Some(p), Some(fid)) => {
+            let mut s = conn.prepare(
+                "SELECT id, title, content, folder_id, created_at, updated_at FROM notes \
+                 WHERE folder_id = ?1 AND (title LIKE ?2 OR content LIKE ?2) \
+                 ORDER BY updated_at DESC",
+            )?;
+            let r = s.query_map(params![fid, p], map_note_row)?.collect::<rusqlite::Result<_>>()?; r
+        }
+        (Some(p), None) => {
+            let mut s = conn.prepare(
+                "SELECT id, title, content, folder_id, created_at, updated_at FROM notes \
+                 WHERE title LIKE ?1 OR content LIKE ?1 \
+                 ORDER BY updated_at DESC",
+            )?;
+            let r = s.query_map(params![p], map_note_row)?.collect::<rusqlite::Result<_>>()?; r
+        }
+        (None, Some(fid)) => {
+            let mut s = conn.prepare(
+                "SELECT id, title, content, folder_id, created_at, updated_at FROM notes \
+                 WHERE folder_id = ?1 \
+                 ORDER BY updated_at DESC",
+            )?;
+            let r = s.query_map(params![fid], map_note_row)?.collect::<rusqlite::Result<_>>()?; r
+        }
+        (None, None) => {
+            let mut s = conn.prepare(
+                "SELECT id, title, content, folder_id, created_at, updated_at FROM notes \
+                 ORDER BY updated_at DESC",
+            )?;
+            let r = s.query_map([], map_note_row)?.collect::<rusqlite::Result<_>>()?; r
+        }
+    };
+    Ok(rows)
+}
+
+pub fn update_note_file_folder(conn: &Connection, id: &str, folder_id: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET folder_id = ?1 WHERE id = ?2",
+        params![folder_id, id],
+    )?;
+    Ok(())
+}
+
+pub fn update_note_file_title(conn: &Connection, id: &str, title: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
+        params![title, id],
+    )?;
+    Ok(())
+}
+
+pub fn update_note_file_content(conn: &Connection, id: &str, content: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET content = ?1, updated_at = datetime('now') WHERE id = ?2",
+        params![content, id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_note_file(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+// --- Rich notes (per-meeting) ---
+
+pub fn get_notes_content(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT notes_content FROM meetings WHERE id = ?1")?;
+    let result = stmt
+        .query_row(params![id], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten();
+    Ok(result)
+}
+
+pub fn save_notes_content(conn: &Connection, id: &str, content: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE meetings SET notes_content = ?1 WHERE id = ?2",
+        params![content, id],
+    )?;
+    Ok(())
+}
+
+pub fn get_all_meeting_tags(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, Vec<UserTagRow>>> {
+    let mut stmt = conn.prepare(
+        "SELECT mt.meeting_id, ut.id, ut.name, ut.color
+         FROM meeting_tags mt
+         JOIN user_tags ut ON ut.id = mt.tag_id
+         ORDER BY ut.created_at ASC",
+    )?;
+    let mut map: std::collections::HashMap<String, Vec<UserTagRow>> =
+        std::collections::HashMap::new();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            UserTagRow { id: row.get(1)?, name: row.get(2)?, color: row.get(3)? },
+        ))
+    })?
+    .filter_map(|r| r.ok())
+    .for_each(|(mid, tag)| {
+        map.entry(mid).or_default().push(tag);
+    });
+    Ok(map)
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use commands::AppState;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const SIDECAR_DIR: &str = env!("SIDECAR_DIR");
 const PARAKEET_PORT: u16 = 8765;
@@ -20,6 +20,17 @@ const OLLAMA_MODEL: &str = "qwen3.5:9b";
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    use tauri_plugin_global_shortcut::ShortcutState;
+                    if event.state() == ShortcutState::Pressed {
+                        let _ = app.emit("recording-shortcut", ());
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             let app_handle = app.handle().clone();
 
@@ -54,6 +65,10 @@ pub fn run() {
             app.manage(state);
             app.manage(audio::spawn_audio_thread());
 
+            // Register global shortcut Cmd+Shift+R
+            use tauri_plugin_global_shortcut::GlobalShortcutExt;
+            let _ = app.global_shortcut().register("CmdOrCtrl+Shift+R");
+
             let handle2 = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = ollama.check_health().await {
@@ -85,9 +100,20 @@ pub fn run() {
             commands::get_meeting_detail,
             commands::update_meeting,
             commands::delete_meeting,
+            commands::list_trashed_meetings,
+            commands::restore_meeting,
+            commands::permanently_delete_meeting,
             commands::restore_summary,
             commands::add_manual_note,
+            commands::save_meeting_notes,
             commands::export_meeting_markdown,
+            // Standalone notes
+            commands::list_notes,
+            commands::get_note,
+            commands::create_note,
+            commands::save_note,
+            commands::delete_note,
+            commands::assign_note_folder,
             // Folders
             commands::list_folders,
             commands::create_folder,
@@ -98,6 +124,15 @@ pub fn run() {
             commands::list_tags,
             commands::create_tag,
             commands::delete_tag,
+            commands::set_meeting_tags,
+            // Phase 3: new features
+            commands::toggle_pin_meeting,
+            commands::set_meeting_color,
+            commands::get_app_settings,
+            commands::save_app_settings,
+            commands::list_audio_devices,
+            commands::get_audio_level,
+            commands::import_audio_file,
         ])
         .build(tauri::generate_context!())
         .expect("error building Tauri application")

@@ -8,9 +8,16 @@ import {
   Folder,
   UserTag,
 } from "../lib/types";
-import { formatTime, Spinner, MarkdownBody } from "./shared";
 
-type Tab = "summary" | "transcript" | "chat";
+const TAG_COLORS = [
+  "#ef4444", "#f97316", "#eab308", "#22c55e",
+  "#14b8a6", "#3b82f6", "#8b5cf6", "#ec4899",
+  "#06b6d4", "#6b7280",
+];
+import { formatTime, Spinner, MarkdownBody } from "./shared";
+import NoteEditor from "./NoteEditor";
+
+type Tab = "summary" | "transcript" | "chat" | "notes";
 
 interface Props {
   meetingId: string;
@@ -48,6 +55,13 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
 
   // Export
   const [exportBusy, setExportBusy] = useState(false);
+
+  // Tag editing
+  const [showTagDropdown, setShowTagDropdown] = useState(false);
+  const [createTagName, setCreateTagName] = useState("");
+  const [createTagColor, setCreateTagColor] = useState(TAG_COLORS[0]);
+  const [showCreateTag, setShowCreateTag] = useState(false);
+  const tagDropdownRef = useRef<HTMLDivElement>(null);
 
   const loadDetail = useCallback(async () => {
     setLoading(true);
@@ -108,24 +122,59 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatHistory, streamingContent]);
 
+  useEffect(() => {
+    if (!showTagDropdown) return;
+    const handler = (e: MouseEvent) => {
+      if (tagDropdownRef.current && !tagDropdownRef.current.contains(e.target as Node)) {
+        setShowTagDropdown(false);
+        setShowCreateTag(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showTagDropdown]);
+
   // ---- Title editing ----
 
   async function saveTitle() {
     if (!detail || !titleDraft.trim()) { setEditingTitle(false); return; }
     setEditingTitle(false);
-    await invoke("update_meeting", { args: { id: meetingId, title: titleDraft.trim(), subject_tag: null } });
+    await invoke("update_meeting", { args: { id: meetingId, title: titleDraft.trim() } });
     setDetail((d) => d ? { ...d, title: titleDraft.trim() } : d);
     window.dispatchEvent(new Event("scribe:reload-meetings"));
   }
 
-  // ---- Tag ----
+  // ---- Tags ----
 
-  async function handleTagChange(tag: string) {
-    await invoke("update_meeting", {
-      args: { id: meetingId, title: null, subject_tag: tag },
-    });
-    setDetail((d) => d ? { ...d, subject_tag: tag || null } : d);
+  async function handleSetMeetingTags(tagIds: string[]) {
+    await invoke("set_meeting_tags", { meetingId, tagIds });
+    setDetail((d) => d ? { ...d, tags: userTags.filter((t) => tagIds.includes(t.id)) } : d);
     window.dispatchEvent(new Event("scribe:reload-meetings"));
+  }
+
+  async function handleAddTag(tagId: string) {
+    if (!detail || detail.tags.some((t) => t.id === tagId)) return;
+    await handleSetMeetingTags([...detail.tags.map((t) => t.id), tagId]);
+  }
+
+  async function handleRemoveTag(tagId: string) {
+    if (!detail) return;
+    await handleSetMeetingTags(detail.tags.map((t) => t.id).filter((id) => id !== tagId));
+  }
+
+  async function handleCreateAndAddTag() {
+    if (!createTagName.trim() || !detail) return;
+    try {
+      const tag = await invoke<UserTag>("create_tag", {
+        args: { name: createTagName.trim(), color: createTagColor },
+      });
+      const refreshed = await invoke<UserTag[]>("list_tags");
+      setUserTags(refreshed);
+      await handleSetMeetingTags([...detail.tags.map((t) => t.id), tag.id]);
+      setCreateTagName("");
+      setShowCreateTag(false);
+      setShowTagDropdown(false);
+    } catch { /* ignore */ }
   }
 
   // ---- Folder ----
@@ -277,12 +326,11 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   });
 
   const activeFolder = folders.find((f) => f.id === detail.folder_id);
-  const activeTag = userTags.find((t) => t.name === detail.subject_tag);
 
   return (
     <div className="flex flex-col h-full">
       {/* Meeting header */}
-      <div className="px-6 py-4 border-b border-gray-800 flex items-start justify-between gap-4">
+      <div className="px-6 py-4 border-b border-gray-800 flex items-start justify-between gap-4" data-print-hide={undefined}>
         <div className="flex-1 min-w-0">
           {editingTitle ? (
             <input
@@ -304,7 +352,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
               </h1>
               <button
                 onClick={() => setEditingTitle(true)}
-                className="shrink-0 text-gray-600 hover:text-gray-400 transition-colors"
+                className="shrink-0 text-gray-600 hover:text-gray-400 transition-colors no-print"
                 title="Rename"
               >
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -328,21 +376,24 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
                 {activeFolder.name}
               </span>
             )}
-            {detail.subject_tag && (
+            {detail.tags.map((tag) => (
               <span
-                className="text-xs px-2 py-0.5 rounded-full font-medium"
-                style={activeTag
-                  ? { background: activeTag.color + "33", color: activeTag.color }
-                  : { background: "#374151", color: "#9ca3af" }
-                }
+                key={tag.id}
+                className="group relative text-xs px-2 py-0.5 rounded-full font-medium flex items-center gap-1"
+                style={{ background: tag.color + "33", color: tag.color }}
               >
-                {detail.subject_tag}
+                {tag.name}
+                <button
+                  onClick={() => handleRemoveTag(tag.id)}
+                  className="opacity-0 group-hover:opacity-100 text-[10px] leading-none transition-opacity hover:text-white"
+                  title="Remove tag"
+                >✕</button>
               </span>
-            )}
+            ))}
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+        <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end no-print" data-print-hide="">
           {/* Folder selector */}
           <select
             value={detail.folder_id ?? ""}
@@ -355,17 +406,84 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
             ))}
           </select>
 
-          {/* Tag selector */}
-          <select
-            value={detail.subject_tag ?? ""}
-            onChange={(e) => handleTagChange(e.target.value)}
-            className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1 text-xs text-gray-300 focus:outline-none focus:ring-1 focus:ring-indigo-500 max-w-[110px]"
+          {/* Tag picker */}
+          <div className="relative" ref={tagDropdownRef}>
+            <button
+              onClick={() => { setShowTagDropdown((v) => !v); setShowCreateTag(false); }}
+              className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1 text-xs text-gray-300 hover:border-gray-600 transition-colors focus:outline-none"
+            >
+              Tags{detail.tags.length > 0 ? ` (${detail.tags.length})` : ""}
+            </button>
+            {showTagDropdown && (
+              <div className="absolute right-0 top-full mt-1 z-20 bg-gray-800 border border-gray-700 rounded-lg shadow-xl py-1 min-w-[160px]">
+                <div className="max-h-48 overflow-y-auto">
+                  {userTags.map((tag) => {
+                    const checked = detail.tags.some((t) => t.id === tag.id);
+                    return (
+                      <button
+                        key={tag.id}
+                        className="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700 flex items-center gap-2"
+                        onClick={() => checked ? handleRemoveTag(tag.id) : handleAddTag(tag.id)}
+                      >
+                        <span
+                          className="w-3.5 h-3.5 rounded border flex items-center justify-center shrink-0 text-[8px] font-bold text-white"
+                          style={checked
+                            ? { background: tag.color, borderColor: tag.color }
+                            : { borderColor: "#4b5563" }}
+                        >
+                          {checked ? "✓" : ""}
+                        </span>
+                        <span className="flex-1 truncate">{tag.name}</span>
+                        <span className="w-2 h-2 rounded-full shrink-0" style={{ background: tag.color }} />
+                      </button>
+                    );
+                  })}
+                </div>
+                {showCreateTag ? (
+                  <div className="px-3 py-2 space-y-1.5 border-t border-gray-700 mt-1">
+                    <input
+                      autoFocus
+                      value={createTagName}
+                      onChange={(e) => setCreateTagName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") handleCreateAndAddTag(); if (e.key === "Escape") setShowCreateTag(false); }}
+                      placeholder="Tag name…"
+                      className="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs text-white placeholder-gray-500 focus:outline-none"
+                    />
+                    <div className="flex gap-1 flex-wrap">
+                      {TAG_COLORS.map((c) => (
+                        <button
+                          key={c}
+                          onClick={() => setCreateTagColor(c)}
+                          className={`w-3.5 h-3.5 rounded-full ${createTagColor === c ? "ring-1 ring-white" : ""}`}
+                          style={{ background: c }}
+                        />
+                      ))}
+                    </div>
+                    <div className="flex gap-1">
+                      <button onClick={handleCreateAndAddTag} className="flex-1 text-[10px] py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded">Create</button>
+                      <button onClick={() => setShowCreateTag(false)} className="text-[10px] py-1 px-2 text-gray-500 hover:text-gray-300">Cancel</button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    className="w-full text-left px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-700 flex items-center gap-1.5 border-t border-gray-700 mt-1"
+                    onClick={() => setShowCreateTag(true)}
+                  >
+                    <span className="text-sm leading-none">+</span>
+                    New tag…
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          <button
+            onClick={() => window.print()}
+            className="btn-ghost text-xs px-3 py-1.5"
+            title="Print / Export PDF"
           >
-            <option value="">No tag</option>
-            {userTags.map((t) => (
-              <option key={t.id} value={t.name}>{t.name}</option>
-            ))}
-          </select>
+            ⎙ Print
+          </button>
 
           <button
             onClick={handleExport}
@@ -397,8 +515,8 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
       )}
 
       {/* Tabs */}
-      <div className="flex border-b border-gray-800 px-6">
-        {(["summary", "transcript", "chat"] as Tab[]).map((t) => (
+      <div className="flex border-b border-gray-800 px-6 no-print" data-print-hide="">
+        {(["summary", "transcript", "notes", "chat"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -419,14 +537,14 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
       </div>
 
       {/* Tab content */}
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto p-6" id="print-content">
 
         {/* ----- Summary ----- */}
         {tab === "summary" && (
           <div className="space-y-4">
             {currentSummary ? (
               <>
-                <div className="flex justify-end">
+                <div className="flex justify-end no-print">
                   <button
                     onClick={handleCopySummary}
                     className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1.5 transition-colors"
@@ -457,7 +575,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
             )}
 
             {/* Resummary input */}
-            <div className="pt-4 border-t border-gray-800 flex gap-2">
+            <div className="pt-4 border-t border-gray-800 flex gap-2 no-print">
               <input
                 type="text"
                 value={resummaryInput}
@@ -490,7 +608,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
 
             {/* Version history */}
             {detail.summaries.length > 1 && (
-              <div className="pt-2">
+              <div className="pt-2 no-print">
                 <button
                   onClick={() => setShowVersions((v) => !v)}
                   className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
@@ -560,6 +678,19 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
           </div>
         )}
 
+        {/* ----- Notes ----- */}
+        {tab === "notes" && (
+          <div className="-m-6 h-full">
+            <NoteEditor
+              key={meetingId}
+              initialContent={detail.notes_content}
+              onSave={async (html) => {
+                await invoke("save_meeting_notes", { meetingId, content: html });
+              }}
+            />
+          </div>
+        )}
+
         {/* ----- Chat ----- */}
         {tab === "chat" && (
           <div className="flex flex-col h-full gap-4">
@@ -594,7 +725,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
               )}
               <div ref={chatEndRef} />
             </div>
-            <div className="flex gap-2 pt-2 border-t border-gray-800 shrink-0">
+            <div className="flex gap-2 pt-2 border-t border-gray-800 shrink-0 no-print">
               <input
                 type="text"
                 value={chatInput}

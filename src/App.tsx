@@ -1,18 +1,37 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { AppView } from "./lib/types";
 import Sidebar from "./components/Sidebar";
 import RecordView from "./components/RecordView";
 import MeetingView from "./components/MeetingView";
 import SettingsView from "./components/SettingsView";
+import TrashView from "./components/TrashView";
+import NoteDetailView from "./components/NoteDetailView";
 
 export default function App() {
   const [view, setView] = useState<AppView>({ kind: "home" });
+
+  // Apply saved theme on mount
+  useEffect(() => {
+    const theme = localStorage.getItem("theme") ?? "dark";
+    document.documentElement.className = theme;
+  }, []);
 
   // Disable the native browser/webview context menu (removes "Inspect Element" etc.)
   useEffect(() => {
     const handler = (e: MouseEvent) => e.preventDefault();
     document.addEventListener("contextmenu", handler);
     return () => document.removeEventListener("contextmenu", handler);
+  }, []);
+
+  // Forward global shortcut event from Tauri to the window
+  useEffect(() => {
+    const unlisten = listen("recording-shortcut", () => {
+      window.dispatchEvent(new Event("scribe:recording-shortcut"));
+    });
+    return () => {
+      unlisten.then((u) => u());
+    };
   }, []);
 
   function handleMeetingReady(id: string) {
@@ -37,6 +56,10 @@ export default function App() {
         );
       case "settings":
         return <SettingsView />;
+      case "trash":
+        return <TrashView />;
+      case "note":
+        return <NoteDetailView noteId={view.id} onDeleted={() => setView({ kind: "home" })} />;
       default:
         return <HomeHint onRecord={() => setView({ kind: "record" })} />;
     }

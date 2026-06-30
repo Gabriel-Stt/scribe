@@ -42,10 +42,12 @@ export interface UserTag {
 export interface MeetingListItem {
   id: string;
   title: string;
-  subject_tag: string | null;
   folder_id: string | null;
   created_at: string;
   duration_seconds: number | null;
+  is_pinned: boolean;
+  deleted_at: string | null;
+  tags: UserTag[];
 }
 
 export interface NoteItem {
@@ -68,20 +70,41 @@ export interface StoredChatMessage {
 export interface MeetingDetail {
   id: string;
   title: string;
-  subject_tag: string | null;
   folder_id: string | null;
   created_at: string;
   duration_seconds: number | null;
   audio_path: string | null;
   active_summary_version: number | null;
+  is_pinned: boolean;
   segments: TranscriptSegment[];
   notes: NoteItem[];
   summaries: SummaryVersionItem[];
   chat_messages: StoredChatMessage[];
+  tags: UserTag[];
+  notes_content: string | null;
+}
+
+export interface AppSettings {
+  auto_delete_audio: boolean;
+  recordings_dir: string | null;
+  selected_device: string | null;
+  sort_by: string;
+  default_tag: string | null;
+}
+
+export interface NoteFile {
+  id: string;
+  title: string;
+  content: string;
+  folder_id: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export type AppView =
   | { kind: "home" }
   | { kind: "record" }
   | { kind: "meeting"; id: string }
-  | { kind: "settings" };
+  | { kind: "note"; id: string }
+  | { kind: "settings" }
+  | { kind: "trash" };
