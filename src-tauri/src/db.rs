@@ -24,6 +24,15 @@ pub fn init(conn: &Connection) -> Result<()> {
          );"
     );
     let _ = conn.execute_batch("ALTER TABLE notes ADD COLUMN folder_id TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE meetings ADD COLUMN action_items TEXT;");
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS note_meetings (
+             note_id    TEXT NOT NULL,
+             meeting_id TEXT NOT NULL,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             PRIMARY KEY (note_id, meeting_id)
+         );"
+    );
     let _ = conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     );
@@ -780,6 +789,75 @@ pub fn update_note_file_content(conn: &Connection, id: &str, content: &str) -> R
 pub fn delete_note_file(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+// --- Action items ---
+
+pub fn get_action_items(conn: &Connection, meeting_id: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT action_items FROM meetings WHERE id = ?1")?;
+    let result = stmt
+        .query_row(params![meeting_id], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten();
+    Ok(result)
+}
+
+pub fn save_action_items(conn: &Connection, meeting_id: &str, json: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE meetings SET action_items = ?1 WHERE id = ?2",
+        params![json, meeting_id],
+    )?;
+    Ok(())
+}
+
+// --- Note-meeting links ---
+
+pub fn link_note_meeting(conn: &Connection, note_id: &str, meeting_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO note_meetings (note_id, meeting_id) VALUES (?1, ?2)",
+        params![note_id, meeting_id],
+    )?;
+    Ok(())
+}
+
+pub fn unlink_note_meeting(conn: &Connection, note_id: &str, meeting_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM note_meetings WHERE note_id = ?1 AND meeting_id = ?2",
+        params![note_id, meeting_id],
+    )?;
+    Ok(())
+}
+
+pub struct LinkedMeetingRow {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+}
+
+pub fn get_note_linked_meetings(conn: &Connection, note_id: &str) -> Result<Vec<LinkedMeetingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.title, m.created_at \
+         FROM meetings m JOIN note_meetings nm ON nm.meeting_id = m.id \
+         WHERE nm.note_id = ?1 AND m.deleted_at IS NULL \
+         ORDER BY nm.created_at DESC",
+    )?;
+    let r = stmt
+        .query_map(params![note_id], |row| {
+            Ok(LinkedMeetingRow { id: row.get(0)?, title: row.get(1)?, created_at: row.get(2)? })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(r)
+}
+
+pub fn get_meeting_linked_notes(conn: &Connection, meeting_id: &str) -> Result<Vec<NoteFileRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.title, n.content, n.folder_id, n.created_at, n.updated_at \
+         FROM notes n JOIN note_meetings nm ON nm.note_id = n.id \
+         WHERE nm.meeting_id = ?1 \
+         ORDER BY nm.created_at DESC",
+    )?;
+    let r = stmt.query_map(params![meeting_id], map_note_row)?.collect::<rusqlite::Result<_>>()?;
+    Ok(r)
 }
 
 // --- Rich notes (per-meeting) ---

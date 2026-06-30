@@ -601,6 +601,19 @@ pub struct StoredChatMessage {
     pub content: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ActionItemResponse {
+    pub text: String,
+    pub done: bool,
+}
+
+#[derive(Serialize)]
+pub struct LinkedMeetingItem {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+}
+
 #[derive(Serialize)]
 pub struct MeetingDetail {
     pub id: String,
@@ -617,6 +630,8 @@ pub struct MeetingDetail {
     pub chat_messages: Vec<StoredChatMessage>,
     pub tags: Vec<UserTagItem>,
     pub notes_content: Option<String>,
+    pub action_items: Vec<ActionItemResponse>,
+    pub linked_notes: Vec<NoteFileItem>,
 }
 
 #[tauri::command]
@@ -666,6 +681,18 @@ pub async fn get_meeting_detail(
 
     let notes_content = db::get_notes_content(&conn, &meeting_id).map_err(map_err)?;
 
+    let action_items: Vec<ActionItemResponse> = db::get_action_items(&conn, &meeting_id)
+        .map_err(map_err)?
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let linked_notes = db::get_meeting_linked_notes(&conn, &meeting_id)
+        .map_err(map_err)?
+        .into_iter()
+        .map(note_item)
+        .collect();
+
     Ok(MeetingDetail {
         id: row.id,
         title: row.title,
@@ -681,6 +708,8 @@ pub async fn get_meeting_detail(
         chat_messages,
         tags,
         notes_content,
+        action_items,
+        linked_notes,
     })
 }
 
@@ -911,6 +940,96 @@ pub async fn save_note(state: State<'_, AppState>, args: SaveNoteArgs) -> Result
 pub async fn delete_note(state: State<'_, AppState>, note_id: String) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     db::delete_note_file(&conn, &note_id).map_err(map_err)
+}
+
+// ---- Action items ----------------------------------------------------------
+
+#[tauri::command]
+pub async fn extract_action_items(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<ActionItemResponse>, String> {
+    let full_text = {
+        let conn = state.db.lock().unwrap();
+        db::get_full_text(&conn, &meeting_id)
+            .map_err(map_err)?
+            .ok_or_else(|| "Meeting not found".to_string())?
+    };
+    if full_text.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    let messages = context_file::build_action_items_messages(&full_text);
+    let raw = state.llm.chat(messages).await.map_err(map_err)?;
+    let items: Vec<ActionItemResponse> = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let text = l
+                .trim_start_matches("- ")
+                .trim_start_matches("* ")
+                .trim_start_matches("• ")
+                .trim()
+                .to_string();
+            ActionItemResponse { text, done: false }
+        })
+        .filter(|a| !a.text.is_empty())
+        .collect();
+    let json = serde_json::to_string(&items).map_err(map_err)?;
+    let conn = state.db.lock().unwrap();
+    db::save_action_items(&conn, &meeting_id, &json).map_err(map_err)?;
+    Ok(items)
+}
+
+#[derive(Deserialize)]
+pub struct SaveActionItemsArgs {
+    pub meeting_id: String,
+    pub items: Vec<ActionItemResponse>,
+}
+
+#[tauri::command]
+pub async fn save_action_items(
+    state: State<'_, AppState>,
+    args: SaveActionItemsArgs,
+) -> Result<(), String> {
+    let json = serde_json::to_string(&args.items).map_err(map_err)?;
+    let conn = state.db.lock().unwrap();
+    db::save_action_items(&conn, &args.meeting_id, &json).map_err(map_err)
+}
+
+// ---- Note-meeting links ----------------------------------------------------
+
+#[tauri::command]
+pub async fn link_note_to_meeting(
+    state: State<'_, AppState>,
+    note_id: String,
+    meeting_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::link_note_meeting(&conn, &note_id, &meeting_id).map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn unlink_note_from_meeting(
+    state: State<'_, AppState>,
+    note_id: String,
+    meeting_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::unlink_note_meeting(&conn, &note_id, &meeting_id).map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn get_note_linked_meetings(
+    state: State<'_, AppState>,
+    note_id: String,
+) -> Result<Vec<LinkedMeetingItem>, String> {
+    let conn = state.db.lock().unwrap();
+    let rows = db::get_note_linked_meetings(&conn, &note_id).map_err(map_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| LinkedMeetingItem { id: r.id, title: r.title, created_at: r.created_at })
+        .collect())
 }
 
 // ---- Rich notes (per-meeting) ----------------------------------------------

@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
@@ -14,6 +14,7 @@ type SharedWavWriter = Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>;
 pub enum AudioCmd {
     Start {
         path: PathBuf,
+        device_name: Option<String>,
         reply: oneshot::Sender<Result<()>>,
     },
     Pause {
@@ -28,6 +29,9 @@ pub enum AudioCmd {
     Status {
         reply: oneshot::Sender<String>,
     },
+    ListDevices {
+        reply: oneshot::Sender<Vec<String>>,
+    },
 }
 
 // AudioHandle is Send+Sync and lives in Tauri managed state.
@@ -35,15 +39,16 @@ pub enum AudioCmd {
 // cpal::Stream (not Send) ever lives.
 pub struct AudioHandle {
     sender: Mutex<std::sync::mpsc::Sender<AudioCmd>>,
+    level: Arc<AtomicU32>,
 }
 
 impl AudioHandle {
-    pub async fn start(&self, path: PathBuf) -> Result<()> {
+    pub async fn start(&self, path: PathBuf, device_name: Option<String>) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.sender
             .lock()
             .unwrap()
-            .send(AudioCmd::Start { path, reply: tx })
+            .send(AudioCmd::Start { path, device_name, reply: tx })
             .map_err(|_| anyhow!("Audio thread is not running"))?;
         rx.await.map_err(|_| anyhow!("Audio thread closed unexpectedly"))?
     }
@@ -91,19 +96,40 @@ impl AudioHandle {
         }
         rx.await.unwrap_or_else(|_| "error".to_string())
     }
+
+    pub async fn list_devices(&self) -> Vec<String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .lock()
+            .unwrap()
+            .send(AudioCmd::ListDevices { reply: tx })
+            .is_err()
+        {
+            return vec![];
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    pub fn get_level(&self) -> f32 {
+        f32::from_bits(self.level.load(Ordering::Relaxed))
+    }
 }
 
 // Spawns the dedicated audio thread and returns a handle to it.
 pub fn spawn_audio_thread() -> AudioHandle {
     let (tx, rx) = std::sync::mpsc::channel::<AudioCmd>();
+    let level = Arc::new(AtomicU32::new(0u32));
+    let level_thread = Arc::clone(&level);
 
     std::thread::Builder::new()
         .name("scribe-audio".to_string())
-        .spawn(move || audio_loop(rx))
+        .spawn(move || audio_loop(rx, level_thread))
         .expect("failed to spawn audio thread");
 
     AudioHandle {
         sender: Mutex::new(tx),
+        level,
     }
 }
 
@@ -113,27 +139,36 @@ struct RecordingCtx {
     writer: SharedWavWriter,
     paused: Arc<AtomicBool>,
     output_path: Option<PathBuf>,
+    level: Arc<AtomicU32>,
 }
 
 impl RecordingCtx {
-    fn new() -> Self {
+    fn new(level: Arc<AtomicU32>) -> Self {
         Self {
             stream: None,
             writer: Arc::new(Mutex::new(None)),
             paused: Arc::new(AtomicBool::new(false)),
             output_path: None,
+            level,
         }
     }
 
-    fn start(&mut self, path: PathBuf) -> Result<()> {
+    fn start(&mut self, path: PathBuf, device_name: Option<String>) -> Result<()> {
         if self.stream.is_some() {
             return Err(anyhow!("Already recording"));
         }
 
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("No microphone found. Please connect a microphone and grant permission in System Settings → Privacy → Microphone."))?;
+        let device = if let Some(name) = &device_name {
+            let mut found = None;
+            if let Ok(mut devs) = host.input_devices() {
+                found = devs.find(|d| d.name().ok().as_deref() == Some(name.as_str()));
+            }
+            found.ok_or_else(|| anyhow!("Audio device '{name}' not found. Check Settings."))?
+        } else {
+            host.default_input_device()
+                .ok_or_else(|| anyhow!("No microphone found. Please connect a microphone and grant permission in System Settings → Privacy → Microphone."))?
+        };
 
         let config = device
             .default_input_config()
@@ -156,6 +191,7 @@ impl RecordingCtx {
         let shared_writer: SharedWavWriter = Arc::new(Mutex::new(Some(wav)));
         let writer_cb = Arc::clone(&shared_writer);
         let paused_cb = Arc::clone(&self.paused);
+        let level_cb = Arc::clone(&self.level);
         self.paused.store(false, Ordering::Relaxed);
 
         let err_fn = |e: cpal::StreamError| eprintln!("[scribe-audio] stream error: {e}");
@@ -164,6 +200,12 @@ impl RecordingCtx {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config.into(),
                 move |data: &[i16], _| {
+                    // Level computation (always, even when paused)
+                    if !data.is_empty() {
+                        let sum_sq: f64 = data.iter().map(|&s| (s as f64 / i16::MAX as f64).powi(2)).sum();
+                        let rms = (sum_sq / data.len() as f64).sqrt() as f32;
+                        level_cb.store(rms.to_bits(), Ordering::Relaxed);
+                    }
                     if paused_cb.load(Ordering::Relaxed) {
                         return;
                     }
@@ -181,6 +223,12 @@ impl RecordingCtx {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _| {
+                    // Level computation (always, even when paused)
+                    if !data.is_empty() {
+                        let sum_sq: f64 = data.iter().map(|&s| (s as f64).powi(2)).sum();
+                        let rms = (sum_sq / data.len() as f64).sqrt() as f32;
+                        level_cb.store(rms.to_bits(), Ordering::Relaxed);
+                    }
                     if paused_cb.load(Ordering::Relaxed) {
                         return;
                     }
@@ -198,6 +246,12 @@ impl RecordingCtx {
             cpal::SampleFormat::I32 => device.build_input_stream(
                 &config.into(),
                 move |data: &[i32], _| {
+                    // Level computation (always, even when paused)
+                    if !data.is_empty() {
+                        let sum_sq: f64 = data.iter().map(|&s| (s as f64 / i32::MAX as f64).powi(2)).sum();
+                        let rms = (sum_sq / data.len() as f64).sqrt() as f32;
+                        level_cb.store(rms.to_bits(), Ordering::Relaxed);
+                    }
                     if paused_cb.load(Ordering::Relaxed) {
                         return;
                     }
@@ -252,6 +306,9 @@ impl RecordingCtx {
         let stream = self.stream.take().ok_or_else(|| anyhow!("Not recording"))?;
         drop(stream); // stops CoreAudio callbacks
 
+        // Reset level when stopped
+        self.level.store(0u32, Ordering::Relaxed);
+
         // Brief settle to let any in-flight callback finish writing
         std::thread::sleep(std::time::Duration::from_millis(150));
 
@@ -276,12 +333,12 @@ impl RecordingCtx {
     }
 }
 
-fn audio_loop(rx: std::sync::mpsc::Receiver<AudioCmd>) {
-    let mut ctx = RecordingCtx::new();
+fn audio_loop(rx: std::sync::mpsc::Receiver<AudioCmd>, level: Arc<AtomicU32>) {
+    let mut ctx = RecordingCtx::new(level);
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            AudioCmd::Start { path, reply } => {
-                let _ = reply.send(ctx.start(path));
+            AudioCmd::Start { path, device_name, reply } => {
+                let _ = reply.send(ctx.start(path, device_name));
             }
             AudioCmd::Pause { reply } => {
                 let _ = reply.send(ctx.pause());
@@ -294,6 +351,14 @@ fn audio_loop(rx: std::sync::mpsc::Receiver<AudioCmd>) {
             }
             AudioCmd::Status { reply } => {
                 let _ = reply.send(ctx.status());
+            }
+            AudioCmd::ListDevices { reply } => {
+                let host = cpal::default_host();
+                let names = host
+                    .input_devices()
+                    .map(|devs| devs.filter_map(|d| d.name().ok()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let _ = reply.send(names);
             }
         }
     }

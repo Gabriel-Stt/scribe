@@ -32,3 +32,13 @@
     @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white text-sm font-medium transition-colors;
   }
 }
+
+/* Indigo colors work in both themes since they're vivid */
+
+@media print {
+  .btn-primary, .btn-secondary, .btn-ghost, .btn-danger {
+    display: none !important;
+  }
+  .md-body h1, .md-body h2, .md-body h3 { color: black !important; }
+  .md-body li, .md-body p, .md-body strong { color: #111827 !important; }
+}

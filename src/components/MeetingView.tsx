@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   MeetingDetail,
@@ -7,6 +7,8 @@ import {
   StoredChatMessage,
   Folder,
   UserTag,
+  ActionItem,
+  NoteFile,
 } from "../lib/types";
 
 const TAG_COLORS = [
@@ -17,7 +19,7 @@ const TAG_COLORS = [
 import { formatTime, Spinner, MarkdownBody } from "./shared";
 import NoteEditor from "./NoteEditor";
 
-type Tab = "summary" | "transcript" | "chat" | "notes";
+type Tab = "summary" | "transcript" | "actions" | "notes" | "chat";
 
 interface Props {
   meetingId: string;
@@ -56,6 +58,23 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   // Export
   const [exportBusy, setExportBusy] = useState(false);
 
+  // Audio player
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [audioPlaying, setAudioPlaying] = useState(false);
+  const [audioTime, setAudioTime] = useState(0);
+  const [audioDuration, setAudioDuration] = useState(0);
+  const [activeSegmentIdx, setActiveSegmentIdx] = useState<number | null>(null);
+
+  // Action items
+  const [actionItems, setActionItems] = useState<ActionItem[]>([]);
+  const [actionsBusy, setActionsBusy] = useState(false);
+
+  // Linked notes
+  const [linkedNotes, setLinkedNotes] = useState<NoteFile[]>([]);
+  const [allNotes, setAllNotes] = useState<NoteFile[]>([]);
+  const [showLinkNotePicker, setShowLinkNotePicker] = useState(false);
+  const linkNotePickerRef = useRef<HTMLDivElement>(null);
+
   // Tag editing
   const [showTagDropdown, setShowTagDropdown] = useState(false);
   const [createTagName, setCreateTagName] = useState("");
@@ -77,6 +96,8 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
       setCurrentSummary(activeSummary);
       setChatHistory(d.chat_messages as StoredChatMessage[]);
       setTitleDraft(d.title);
+      setActionItems(d.action_items ?? []);
+      setLinkedNotes(d.linked_notes ?? []);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -95,7 +116,18 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   useEffect(() => {
     invoke<Folder[]>("list_folders").then(setFolders).catch(() => {});
     invoke<UserTag[]>("list_tags").then(setUserTags).catch(() => {});
+    invoke<NoteFile[]>("list_notes", { search: null, folderId: null }).then(setAllNotes).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!showLinkNotePicker) return;
+    const h = (e: MouseEvent) => {
+      if (linkNotePickerRef.current && !linkNotePickerRef.current.contains(e.target as Node))
+        setShowLinkNotePicker(false);
+    };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, [showLinkNotePicker]);
 
   // Listen for folder/tag changes from sidebar
   useEffect(() => {
@@ -280,6 +312,43 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
     } finally {
       setExportBusy(false);
     }
+  }
+
+  // ---- Action items ----
+
+  async function handleExtractActions() {
+    setActionsBusy(true);
+    try {
+      const items = await invoke<ActionItem[]>("extract_action_items", { meetingId });
+      setActionItems(items);
+    } catch (e) { setError(String(e)); }
+    finally { setActionsBusy(false); }
+  }
+
+  async function handleToggleAction(idx: number) {
+    const updated = actionItems.map((a, i) => i === idx ? { ...a, done: !a.done } : a);
+    setActionItems(updated);
+    await invoke("save_action_items", { args: { meeting_id: meetingId, items: updated } });
+  }
+
+  async function handleDeleteAction(idx: number) {
+    const updated = actionItems.filter((_, i) => i !== idx);
+    setActionItems(updated);
+    await invoke("save_action_items", { args: { meeting_id: meetingId, items: updated } });
+  }
+
+  // ---- Linked notes ----
+
+  async function handleLinkNote(noteId: string) {
+    await invoke("link_note_to_meeting", { noteId, meetingId });
+    const note = allNotes.find((n) => n.id === noteId);
+    if (note) setLinkedNotes((prev) => [note, ...prev]);
+    setShowLinkNotePicker(false);
+  }
+
+  async function handleUnlinkNote(noteId: string) {
+    await invoke("unlink_note_from_meeting", { noteId, meetingId });
+    setLinkedNotes((prev) => prev.filter((n) => n.id !== noteId));
   }
 
   // ---- Delete ----
@@ -506,6 +575,62 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
         </div>
       </div>
 
+      {/* Audio player */}
+      {detail.audio_path && (
+        <div className="px-6 py-2 border-b border-gray-800 flex items-center gap-3 no-print bg-gray-900/60">
+          <audio
+            ref={audioRef}
+            src={convertFileSrc(detail.audio_path)}
+            onTimeUpdate={() => {
+              const t = audioRef.current?.currentTime ?? 0;
+              setAudioTime(t);
+              const idx = sortedTranscript.findIndex((s, i) => {
+                const next = sortedTranscript[i + 1];
+                return t >= s.start && (next == null || t < next.start);
+              });
+              setActiveSegmentIdx(idx >= 0 ? idx : null);
+            }}
+            onLoadedMetadata={() => setAudioDuration(audioRef.current?.duration ?? 0)}
+            onPlay={() => setAudioPlaying(true)}
+            onPause={() => setAudioPlaying(false)}
+            onEnded={() => setAudioPlaying(false)}
+          />
+          <button
+            onClick={() => audioPlaying ? audioRef.current?.pause() : audioRef.current?.play()}
+            className="w-7 h-7 rounded-full bg-indigo-600 hover:bg-indigo-500 flex items-center justify-center shrink-0 transition-colors"
+          >
+            {audioPlaying ? (
+              <svg className="w-3 h-3 text-white" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
+              </svg>
+            ) : (
+              <svg className="w-3 h-3 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M8 5v14l11-7z" />
+              </svg>
+            )}
+          </button>
+          <span className="text-[10px] text-gray-500 font-mono shrink-0 w-10">
+            {formatTime(Math.floor(audioTime))}
+          </span>
+          <div
+            className="flex-1 h-1.5 bg-gray-800 rounded-full cursor-pointer relative"
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const pct = (e.clientX - rect.left) / rect.width;
+              if (audioRef.current) audioRef.current.currentTime = pct * audioDuration;
+            }}
+          >
+            <div
+              className="h-full bg-indigo-500 rounded-full transition-all"
+              style={{ width: audioDuration > 0 ? `${(audioTime / audioDuration) * 100}%` : "0%" }}
+            />
+          </div>
+          <span className="text-[10px] text-gray-600 font-mono shrink-0 w-10 text-right">
+            {formatTime(Math.floor(audioDuration))}
+          </span>
+        </div>
+      )}
+
       {/* Error banner */}
       {error && (
         <div className="mx-6 mt-3 bg-red-900/50 border border-red-700 rounded-lg p-3 text-xs text-red-300 flex justify-between">
@@ -516,17 +641,22 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
 
       {/* Tabs */}
       <div className="flex border-b border-gray-800 px-6 no-print" data-print-hide="">
-        {(["summary", "transcript", "notes", "chat"] as Tab[]).map((t) => (
+        {(["summary", "transcript", "actions", "notes", "chat"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
-            className={`px-4 py-2.5 text-sm font-medium capitalize transition-colors border-b-2 -mb-px ${
+            className={`px-3 py-2.5 text-sm font-medium capitalize transition-colors border-b-2 -mb-px ${
               tab === t
                 ? "border-indigo-500 text-white"
                 : "border-transparent text-gray-500 hover:text-gray-300"
             }`}
           >
             {t}
+            {t === "actions" && actionItems.length > 0 && (
+              <span className="ml-1.5 text-xs bg-gray-700 text-gray-400 rounded-full px-1.5">
+                {actionItems.filter((a) => !a.done).length}
+              </span>
+            )}
             {t === "chat" && chatHistory.length > 0 && (
               <span className="ml-1.5 text-xs bg-gray-700 text-gray-400 rounded-full px-1.5">
                 {chatHistory.length}
@@ -659,8 +789,16 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
             )}
             {transcriptEntries.map((entry, i) =>
               entry.kind === "segment" ? (
-                <div key={i} className="flex gap-3 text-sm py-0.5">
-                  <span className="text-gray-600 font-mono shrink-0 w-14 text-right">
+                <div
+                  key={i}
+                  className={`flex gap-3 text-sm py-0.5 rounded px-1 -mx-1 transition-colors cursor-pointer ${
+                    activeSegmentIdx != null && sortedTranscript[activeSegmentIdx]?.start === entry.start
+                      ? "bg-indigo-900/30"
+                      : "hover:bg-gray-800/40"
+                  }`}
+                  onClick={() => { if (audioRef.current) { audioRef.current.currentTime = entry.start; audioRef.current.play(); } }}
+                >
+                  <span className="text-indigo-500/70 font-mono shrink-0 w-14 text-right text-xs pt-0.5">
                     {formatTime(Math.floor(entry.start))}
                   </span>
                   <span className="text-gray-300">{entry.text}</span>
@@ -675,6 +813,124 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
                 </div>
               )
             )}
+          </div>
+        )}
+
+        {/* ----- Actions ----- */}
+        {tab === "actions" && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <p className="text-xs text-gray-500">
+                {actionItems.length === 0
+                  ? "No action items extracted yet."
+                  : `${actionItems.filter((a) => !a.done).length} of ${actionItems.length} remaining`}
+              </p>
+              <button
+                onClick={handleExtractActions}
+                disabled={actionsBusy}
+                className="btn-secondary text-xs disabled:opacity-40"
+              >
+                {actionsBusy ? <Spinner /> : actionItems.length > 0 ? "Re-extract" : "Extract from transcript"}
+              </button>
+            </div>
+
+            {actionItems.length > 0 && (
+              <ul className="space-y-1">
+                {actionItems.map((item, idx) => (
+                  <li
+                    key={idx}
+                    className="flex items-start gap-3 py-2 px-3 rounded-lg hover:bg-gray-800/50 group transition-colors"
+                  >
+                    <button
+                      onClick={() => handleToggleAction(idx)}
+                      className={`mt-0.5 w-4 h-4 rounded border shrink-0 flex items-center justify-center transition-colors ${
+                        item.done
+                          ? "bg-emerald-600 border-emerald-600 text-white"
+                          : "border-gray-600 hover:border-gray-400"
+                      }`}
+                    >
+                      {item.done && (
+                        <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                        </svg>
+                      )}
+                    </button>
+                    <span className={`flex-1 text-sm leading-snug ${item.done ? "line-through text-gray-600" : "text-gray-200"}`}>
+                      {item.text}
+                    </span>
+                    <button
+                      onClick={() => handleDeleteAction(idx)}
+                      className="opacity-0 group-hover:opacity-100 text-gray-700 hover:text-red-400 text-xs transition-opacity shrink-0 mt-0.5"
+                    >✕</button>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            {actionItems.length === 0 && !actionsBusy && (
+              <div className="text-center py-8">
+                <div className="w-10 h-10 rounded-full bg-gray-800 flex items-center justify-center mx-auto mb-3">
+                  <svg className="w-5 h-5 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+                      d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                  </svg>
+                </div>
+                <p className="text-sm text-gray-600">Click "Extract from transcript" to find action items.</p>
+              </div>
+            )}
+
+            {/* Linked notes */}
+            <div className="border-t border-gray-800 pt-4 mt-4">
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-xs text-gray-500 uppercase tracking-widest font-medium">Linked Notes</p>
+                <div className="relative" ref={linkNotePickerRef}>
+                  <button
+                    onClick={() => setShowLinkNotePicker((v) => !v)}
+                    className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+                  >
+                    + Link note
+                  </button>
+                  {showLinkNotePicker && (
+                    <div className="absolute right-0 top-full mt-1 z-20 bg-gray-800 border border-gray-700 rounded-lg shadow-xl py-1 min-w-[200px] max-h-48 overflow-y-auto">
+                      {allNotes.filter((n) => !linkedNotes.some((l) => l.id === n.id)).length === 0 ? (
+                        <p className="px-3 py-2 text-xs text-gray-600">No notes to link</p>
+                      ) : (
+                        allNotes
+                          .filter((n) => !linkedNotes.some((l) => l.id === n.id))
+                          .map((n) => (
+                            <button
+                              key={n.id}
+                              onClick={() => handleLinkNote(n.id)}
+                              className="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700 truncate"
+                            >
+                              {n.title}
+                            </button>
+                          ))
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+              {linkedNotes.length === 0 ? (
+                <p className="text-xs text-gray-700 italic">No notes linked to this recording.</p>
+              ) : (
+                <div className="space-y-1.5">
+                  {linkedNotes.map((note) => (
+                    <div key={note.id} className="flex items-center gap-2 group">
+                      <svg className="w-3 h-3 text-gray-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
+                          d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                      </svg>
+                      <span className="flex-1 text-xs text-gray-300 truncate">{note.title}</span>
+                      <button
+                        onClick={() => handleUnlinkNote(note.id)}
+                        className="opacity-0 group-hover:opacity-100 text-gray-700 hover:text-red-400 text-xs transition-opacity"
+                      >✕</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 

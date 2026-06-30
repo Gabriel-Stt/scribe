@@ -81,6 +81,20 @@ pub fn build_resummary_messages(
     messages
 }
 
+pub fn build_action_items_messages(transcript: &str) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(
+            "You are extracting action items from a meeting or lecture transcript. \
+             List only concrete tasks, commitments, or follow-ups that someone is responsible for completing. \
+             Output one action item per line, starting each line with '- '. \
+             If there are no clear action items, output nothing. \
+             Do not add headers, numbering, or any explanation — only the bullet list."
+                .to_string(),
+        ),
+        ChatMessage::user(format!("Transcript:\n\n{transcript}")),
+    ]
+}
+
 pub fn build_chat_system_message(transcript: &str) -> ChatMessage {
     ChatMessage::system(format!("{CHAT_SYSTEM_PROMPT}\n\nTranscript:\n{transcript}"))
 }

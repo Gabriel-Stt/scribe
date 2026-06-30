@@ -7,9 +7,11 @@ import MeetingView from "./components/MeetingView";
 import SettingsView from "./components/SettingsView";
 import TrashView from "./components/TrashView";
 import NoteDetailView from "./components/NoteDetailView";
+import SearchModal from "./components/SearchModal";
 
 export default function App() {
   const [view, setView] = useState<AppView>({ kind: "home" });
+  const [showSearch, setShowSearch] = useState(false);
 
   // Apply saved theme on mount
   useEffect(() => {
@@ -22,6 +24,18 @@ export default function App() {
     const handler = (e: MouseEvent) => e.preventDefault();
     document.addEventListener("contextmenu", handler);
     return () => document.removeEventListener("contextmenu", handler);
+  }, []);
+
+  // Cmd+K global search
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setShowSearch((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
   }, []);
 
   // Forward global shortcut event from Tauri to the window
@@ -71,6 +85,12 @@ export default function App() {
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {renderMain()}
       </main>
+      {showSearch && (
+        <SearchModal
+          onNavigate={(v) => { setView(v); setShowSearch(false); }}
+          onClose={() => setShowSearch(false)}
+        />
+      )}
     </div>
   );
 }

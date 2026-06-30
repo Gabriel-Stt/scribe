@@ -67,6 +67,17 @@ export interface StoredChatMessage {
   content: string;
 }
 
+export interface ActionItem {
+  text: string;
+  done: boolean;
+}
+
+export interface LinkedMeeting {
+  id: string;
+  title: string;
+  created_at: string;
+}
+
 export interface MeetingDetail {
   id: string;
   title: string;
@@ -82,6 +93,8 @@ export interface MeetingDetail {
   chat_messages: StoredChatMessage[];
   tags: UserTag[];
   notes_content: string | null;
+  action_items: ActionItem[];
+  linked_notes: NoteFile[];
 }
 
 export interface AppSettings {

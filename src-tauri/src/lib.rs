@@ -114,6 +114,13 @@ pub fn run() {
             commands::save_note,
             commands::delete_note,
             commands::assign_note_folder,
+            // Action items
+            commands::extract_action_items,
+            commands::save_action_items,
+            // Note-meeting linking
+            commands::link_note_to_meeting,
+            commands::unlink_note_from_meeting,
+            commands::get_note_linked_meetings,
             // Folders
             commands::list_folders,
             commands::create_folder,

@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { StatusResponse, UserTag } from "../lib/types";
+import { open } from "@tauri-apps/plugin-dialog";
+import { StatusResponse, UserTag, AppSettings } from "../lib/types";
 import { StatusDot, Spinner } from "./shared";
 
 const TAG_COLORS = [
@@ -16,6 +17,7 @@ export default function SettingsView() {
   const [saved, setSaved] = useState(false);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [theme, setTheme] = useState(() => localStorage.getItem("theme") ?? "dark");
 
   // Tags
   const [tags, setTags] = useState<UserTag[]>([]);
@@ -23,11 +25,24 @@ export default function SettingsView() {
   const [newTagColor, setNewTagColor] = useState(TAG_COLORS[0]);
   const [tagBusy, setTagBusy] = useState(false);
 
+  // App settings
+  const [appSettings, setAppSettings] = useState<AppSettings>({
+    auto_delete_audio: false,
+    recordings_dir: null,
+    selected_device: null,
+    sort_by: "date_desc",
+    default_tag: null,
+  });
+  const [audioDevices, setAudioDevices] = useState<string[]>([]);
+  const [settingsSaved, setSettingsSaved] = useState(false);
+
   useEffect(() => {
     invoke<string>("get_context")
       .then((c) => { setContextText(c); setLoading(false); })
       .catch(() => setLoading(false));
     invoke<StatusResponse>("get_status").then(setStatus).catch(() => {});
+    invoke<AppSettings>("get_app_settings").then(setAppSettings).catch(() => {});
+    invoke<string[]>("list_audio_devices").then(setAudioDevices).catch(() => {});
     loadTags();
   }, []);
 
@@ -50,6 +65,25 @@ export default function SettingsView() {
     } finally {
       setSaving(false);
     }
+  }
+
+  async function handleSaveSettings() {
+    try {
+      await invoke("save_app_settings", { settings: appSettings });
+      setSettingsSaved(true);
+      setTimeout(() => setSettingsSaved(false), 2000);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleBrowseDir() {
+    try {
+      const dir = await open({ directory: true, multiple: false });
+      if (dir && typeof dir === "string") {
+        setAppSettings((s) => ({ ...s, recordings_dir: dir }));
+      }
+    } catch { /* ignore */ }
   }
 
   async function handleCreateTag() {
@@ -89,6 +123,122 @@ export default function SettingsView() {
             <button onClick={() => setError(null)} className="ml-3 shrink-0">✕</button>
           </div>
         )}
+
+        {/* Appearance */}
+        <section>
+          <h3 className="text-xs text-gray-500 uppercase tracking-widest mb-3">Appearance</h3>
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-gray-400">Theme</span>
+              <div className="flex gap-2">
+                {(["dark", "light"] as const).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => {
+                      localStorage.setItem("theme", t);
+                      document.documentElement.className = t;
+                      setTheme(t);
+                    }}
+                    className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
+                      theme === t
+                        ? "bg-indigo-600 text-white"
+                        : "bg-gray-800 text-gray-400 hover:text-gray-200"
+                    }`}
+                  >
+                    {t === "dark" ? "🌙 Dark" : "☀️ Light"}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Recording */}
+        <section>
+          <h3 className="text-xs text-gray-500 uppercase tracking-widest mb-3">Recording</h3>
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-4">
+            {/* Audio device picker */}
+            <div>
+              <label className="text-sm text-gray-400 block mb-1.5">Input Device</label>
+              <select
+                value={appSettings.selected_device ?? ""}
+                onChange={(e) =>
+                  setAppSettings((s) => ({ ...s, selected_device: e.target.value || null }))
+                }
+                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              >
+                <option value="">Default microphone</option>
+                {audioDevices.map((d) => (
+                  <option key={d} value={d}>{d}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Recording directory */}
+            <div>
+              <label className="text-sm text-gray-400 block mb-1.5">Recordings Folder</label>
+              <div className="flex gap-2">
+                <input
+                  readOnly
+                  value={appSettings.recordings_dir ?? "(default: app data folder)"}
+                  className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-500 focus:outline-none cursor-default"
+                />
+                <button onClick={handleBrowseDir} className="btn-secondary text-xs px-3">Browse</button>
+                {appSettings.recordings_dir && (
+                  <button
+                    onClick={() => setAppSettings((s) => ({ ...s, recordings_dir: null }))}
+                    className="btn-ghost text-xs px-2"
+                  >
+                    Reset
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Auto-delete */}
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-gray-400">Delete audio file after transcription</p>
+                <p className="text-xs text-gray-600 mt-0.5">Saves disk space. The transcript is always kept.</p>
+              </div>
+              <button
+                onClick={() =>
+                  setAppSettings((s) => ({ ...s, auto_delete_audio: !s.auto_delete_audio }))
+                }
+                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full transition-colors ${
+                  appSettings.auto_delete_audio ? "bg-indigo-600" : "bg-gray-700"
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform mt-0.5 ${
+                    appSettings.auto_delete_audio ? "translate-x-4" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+          </div>
+
+          {/* Save settings button */}
+          <div className="flex items-center gap-3 mt-3">
+            <button onClick={handleSaveSettings} className="btn-primary">
+              {settingsSaved ? "✓ Saved" : "Save Settings"}
+            </button>
+            {settingsSaved && (
+              <span className="text-xs text-emerald-500">Settings saved.</span>
+            )}
+          </div>
+        </section>
+
+        {/* Keyboard Shortcuts */}
+        <section>
+          <h3 className="text-xs text-gray-500 uppercase tracking-widest mb-3">Keyboard Shortcuts</h3>
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 text-sm text-gray-500">
+            <div className="flex justify-between">
+              <span>Start / Stop recording</span>
+              <kbd className="bg-gray-800 px-2 py-0.5 rounded text-xs text-gray-400">⌘⇧R</kbd>
+            </div>
+          </div>
+        </section>
 
         {/* Engine status */}
         <section>

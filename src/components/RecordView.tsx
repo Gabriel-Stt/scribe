@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { Transcript, TranscriptSegment, StatusResponse, MeetingResult, AppView } from "../lib/types";
 import { formatTime, Spinner, StatusDot } from "./shared";
 
@@ -21,10 +22,12 @@ export default function RecordView({ onMeetingReady }: RecordViewProps) {
   const [notes, setNotes] = useState<{ elapsed: number; text: string }[]>([]);
   const [meetingId, setMeetingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [audioLevel, setAudioLevel] = useState(0);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedRef = useRef(0);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const levelPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Status polling
   const pollStatus = useCallback(async () => {
@@ -56,6 +59,24 @@ export default function RecordView({ onMeetingReady }: RecordViewProps) {
     }
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [phase]);
+
+  // Audio level meter polling
+  useEffect(() => {
+    if (phase === "recording") {
+      levelPollRef.current = setInterval(async () => {
+        try {
+          const level = await invoke<number>("get_audio_level");
+          setAudioLevel(level);
+        } catch { /* ignore */ }
+      }, 100);
+    } else {
+      if (levelPollRef.current) clearInterval(levelPollRef.current);
+      if (phase === "idle") setAudioLevel(0);
+    }
+    return () => {
+      if (levelPollRef.current) clearInterval(levelPollRef.current);
     };
   }, [phase]);
 
@@ -169,6 +190,26 @@ export default function RecordView({ onMeetingReady }: RecordViewProps) {
     }
   }
 
+  async function handleImportAudio() {
+    setError(null);
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "Audio", extensions: ["mp3", "m4a", "wav", "aiff", "ogg", "flac"] }],
+      });
+      if (!selected || typeof selected !== "string") return;
+
+      setPhase("transcribing");
+      const result = await invoke<MeetingResult>("import_audio_file", { path: selected });
+      setMeetingId(result.meeting_id);
+      setPhase("done");
+      window.dispatchEvent(new Event("scribe:reload-meetings"));
+    } catch (e) {
+      setError(String(e));
+      setPhase("idle");
+    }
+  }
+
   function handleAddNote() {
     const text = noteInput.trim();
     if (!text) return;
@@ -190,6 +231,17 @@ export default function RecordView({ onMeetingReady }: RecordViewProps) {
     setElapsedSeconds(0);
     elapsedRef.current = 0;
   }
+
+  // Global shortcut listener
+  useEffect(() => {
+    const handler = () => {
+      if (phase === "idle" && asrOk && llmOk) handleStart();
+      else if (phase === "recording" || phase === "paused") handleStop();
+    };
+    window.addEventListener("scribe:recording-shortcut", handler);
+    return () => window.removeEventListener("scribe:recording-shortcut", handler);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, status]);
 
   const asrOk = status?.asr_ready ?? false;
   const llmOk = status?.llm_ready ?? false;
@@ -227,13 +279,22 @@ export default function RecordView({ onMeetingReady }: RecordViewProps) {
         <section className="bg-gray-900 border border-gray-800 rounded-xl p-6">
           <div className="flex items-center gap-4 flex-wrap">
             {phase === "idle" && (
-              <button
-                onClick={handleStart}
-                disabled={!asrOk || !llmOk}
-                className="btn-primary disabled:opacity-40 disabled:cursor-not-allowed text-base px-6 py-3"
-              >
-                <span className="text-red-400">●</span> Start Recording
-              </button>
+              <>
+                <button
+                  onClick={handleStart}
+                  disabled={!asrOk || !llmOk}
+                  className="btn-primary disabled:opacity-40 disabled:cursor-not-allowed text-base px-6 py-3"
+                >
+                  <span className="text-red-400">●</span> Start Recording
+                </button>
+                <button
+                  onClick={handleImportAudio}
+                  disabled={!asrOk || !llmOk}
+                  className="btn-ghost text-sm disabled:opacity-40"
+                >
+                  ↑ Import File
+                </button>
+              </>
             )}
             {isRecording && (
               <>
@@ -266,6 +327,22 @@ export default function RecordView({ onMeetingReady }: RecordViewProps) {
               </div>
             )}
           </div>
+
+          {/* Audio level meter */}
+          {isActive && (
+            <div className="mt-3 flex items-center gap-2">
+              <span className="text-[10px] text-gray-600 uppercase tracking-widest shrink-0">Level</span>
+              <div className="flex-1 h-2 bg-gray-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full rounded-full transition-all duration-75"
+                  style={{
+                    width: `${Math.min(100, audioLevel * 400)}%`,
+                    background: audioLevel > 0.5 ? "#ef4444" : "#22c55e",
+                  }}
+                />
+              </div>
+            </div>
+          )}
 
           {!asrOk && phase === "idle" && (
             <p className="mt-3 text-xs text-amber-500">ASR model is loading — wait before recording.</p>
