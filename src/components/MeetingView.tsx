@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import {
   MeetingDetail,
@@ -9,24 +10,85 @@ import {
   UserTag,
   ActionItem,
   NoteFile,
+  AppView,
 } from "../lib/types";
+import { formatTime, Spinner, MarkdownBody } from "./shared";
+
+function markdownToHtml(md: string): string {
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let inList = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine;
+
+    // Horizontal rule
+    if (/^-{3,}$/.test(line.trim()) || /^\*{3,}$/.test(line.trim())) {
+      if (inList) { out.push("</ul>"); inList = false; }
+      out.push("<hr>");
+      continue;
+    }
+
+    // Headings
+    const h3 = line.match(/^### (.+)/);
+    const h2 = line.match(/^## (.+)/);
+    const h1 = line.match(/^# (.+)/);
+    if (h3 || h2 || h1) {
+      if (inList) { out.push("</ul>"); inList = false; }
+      const lvl = h1 ? 1 : h2 ? 2 : 3;
+      const text = inlineFormat((h1 ?? h2 ?? h3)![1]);
+      out.push(`<h${lvl}>${text}</h${lvl}>`);
+      continue;
+    }
+
+    // Bullet list
+    const bullet = line.match(/^[-*] (.+)/);
+    if (bullet) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push(`<li>${inlineFormat(bullet[1])}</li>`);
+      continue;
+    }
+
+    // Close list on non-bullet
+    if (inList) { out.push("</ul>"); inList = false; }
+
+    // Empty line → paragraph break (skip, already handled by wrapping)
+    if (line.trim() === "") {
+      out.push("<br>");
+      continue;
+    }
+
+    // Regular paragraph line
+    out.push(`<p>${inlineFormat(line)}</p>`);
+  }
+
+  if (inList) out.push("</ul>");
+  return out.join("\n");
+}
+
+function inlineFormat(text: string): string {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+    .replace(/_(.+?)_/g, "<em>$1</em>")
+    .replace(/`(.+?)`/g, "<code>$1</code>");
+}
 
 const TAG_COLORS = [
   "#ef4444", "#f97316", "#eab308", "#22c55e",
   "#14b8a6", "#3b82f6", "#8b5cf6", "#ec4899",
   "#06b6d4", "#6b7280",
 ];
-import { formatTime, Spinner, MarkdownBody } from "./shared";
-import NoteEditor from "./NoteEditor";
 
-type Tab = "summary" | "transcript" | "actions" | "notes" | "chat";
+type Tab = "summary" | "transcript" | "todo" | "chat";
 
 interface Props {
   meetingId: string;
   onDeleted: () => void;
+  onNavigate?: (view: AppView) => void;
 }
 
-export default function MeetingView({ meetingId, onDeleted }: Props) {
+export default function MeetingView({ meetingId, onDeleted, onNavigate }: Props) {
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
   const [tab, setTab] = useState<Tab>("summary");
   const [loading, setLoading] = useState(true);
@@ -69,11 +131,10 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   const [actionItems, setActionItems] = useState<ActionItem[]>([]);
   const [actionsBusy, setActionsBusy] = useState(false);
 
-  // Linked notes
-  const [linkedNotes, setLinkedNotes] = useState<NoteFile[]>([]);
+  // Notes for "send to note" picker
   const [allNotes, setAllNotes] = useState<NoteFile[]>([]);
-  const [showLinkNotePicker, setShowLinkNotePicker] = useState(false);
-  const linkNotePickerRef = useRef<HTMLDivElement>(null);
+  const [showSendToNotePicker, setShowSendToNotePicker] = useState(false);
+  const sendToNotePickerRef = useRef<HTMLDivElement>(null);
 
   // Tag editing
   const [showTagDropdown, setShowTagDropdown] = useState(false);
@@ -97,7 +158,6 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
       setChatHistory(d.chat_messages as StoredChatMessage[]);
       setTitleDraft(d.title);
       setActionItems(d.action_items ?? []);
-      setLinkedNotes(d.linked_notes ?? []);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -120,14 +180,14 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   }, []);
 
   useEffect(() => {
-    if (!showLinkNotePicker) return;
+    if (!showSendToNotePicker) return;
     const h = (e: MouseEvent) => {
-      if (linkNotePickerRef.current && !linkNotePickerRef.current.contains(e.target as Node))
-        setShowLinkNotePicker(false);
+      if (sendToNotePickerRef.current && !sendToNotePickerRef.current.contains(e.target as Node))
+        setShowSendToNotePicker(false);
     };
     document.addEventListener("mousedown", h);
     return () => document.removeEventListener("mousedown", h);
-  }, [showLinkNotePicker]);
+  }, [showSendToNotePicker]);
 
   // Listen for folder/tag changes from sidebar
   useEffect(() => {
@@ -267,19 +327,28 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   }
 
   const [sendToNoteBusy, setSendToNoteBusy] = useState(false);
-  const [sentToNote, setSentToNote] = useState(false);
 
-  async function handleSendToNote() {
+  async function handleSendToNote(noteId: string | null) {
     if (!currentSummary || sendToNoteBusy) return;
+    setShowSendToNotePicker(false);
     setSendToNoteBusy(true);
     try {
-      const note = await invoke<NoteFile>("create_note");
-      const title = detail ? `Summary — ${detail.title}` : "Meeting Summary";
-      const html = `<p>${currentSummary.replace(/\n/g, "</p><p>")}</p>`;
-      await invoke("save_note", { args: { note_id: note.id, title, content: html } });
+      const summaryHtml = markdownToHtml(currentSummary);
+      let resolvedNoteId: string;
+      if (noteId === null) {
+        const note = await invoke<NoteFile>("create_note");
+        const title = detail ? `Summary — ${detail.title}` : "Meeting Summary";
+        await invoke("save_note", { args: { note_id: note.id, title, content: summaryHtml } });
+        resolvedNoteId = note.id;
+      } else {
+        const existing = await invoke<NoteFile | null>("get_note", { noteId });
+        const current = existing?.content ?? "";
+        const separator = current ? `<hr>` : "";
+        await invoke("save_note", { args: { note_id: noteId, title: null, content: current + separator + summaryHtml } });
+        resolvedNoteId = noteId;
+      }
       window.dispatchEvent(new Event("scribe:reload-notes"));
-      setSentToNote(true);
-      setTimeout(() => setSentToNote(false), 2000);
+      onNavigate?.({ kind: "split", left: { kind: "meeting", id: meetingId }, right: { kind: "note", id: resolvedNoteId } });
     } catch { /* ignore */ }
     finally { setSendToNoteBusy(false); }
   }
@@ -317,14 +386,14 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   async function handleExport() {
     setExportBusy(true);
     try {
+      const safeName = (detail?.title ?? "meeting").replace(/[^\w\s\-]/g, "").trim();
+      const path = await save({
+        defaultPath: `${safeName}.md`,
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      });
+      if (!path) return;
       const md = await invoke<string>("export_meeting_markdown", { meetingId });
-      const blob = new Blob([md], { type: "text/markdown" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${(detail?.title ?? "meeting").replace(/[^\w\s-]/g, "")}.md`;
-      a.click();
-      URL.revokeObjectURL(url);
+      await invoke("write_text_file", { path, content: md });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -353,20 +422,6 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
     const updated = actionItems.filter((_, i) => i !== idx);
     setActionItems(updated);
     await invoke("save_action_items", { args: { meeting_id: meetingId, items: updated } });
-  }
-
-  // ---- Linked notes ----
-
-  async function handleLinkNote(noteId: string) {
-    await invoke("link_note_to_meeting", { noteId, meetingId });
-    const note = allNotes.find((n) => n.id === noteId);
-    if (note) setLinkedNotes((prev) => [note, ...prev]);
-    setShowLinkNotePicker(false);
-  }
-
-  async function handleUnlinkNote(noteId: string) {
-    await invoke("unlink_note_from_meeting", { noteId, meetingId });
-    setLinkedNotes((prev) => prev.filter((n) => n.id !== noteId));
   }
 
   // ---- Delete ----
@@ -417,7 +472,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
   return (
     <div className="flex flex-col h-full">
       {/* Meeting header */}
-      <div className="px-6 py-4 border-b border-gray-800 flex items-start justify-between gap-4" data-print-hide={undefined}>
+      <div className="px-6 py-4 border-b border-gray-800 flex items-start justify-between gap-4">
         <div className="flex-1 min-w-0">
           {editingTitle ? (
             <input
@@ -439,7 +494,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
               </h1>
               <button
                 onClick={() => setEditingTitle(true)}
-                className="shrink-0 text-gray-600 hover:text-gray-400 transition-colors no-print"
+                className="shrink-0 text-gray-600 hover:text-gray-400 transition-colors"
                 title="Rename"
               >
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -480,7 +535,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end no-print" data-print-hide="">
+        <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
           {/* Folder selector */}
           <select
             value={detail.folder_id ?? ""}
@@ -565,14 +620,6 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
           </div>
 
           <button
-            onClick={() => window.print()}
-            className="btn-ghost text-xs px-3 py-1.5"
-            title="Print / Export PDF"
-          >
-            ⎙ Print
-          </button>
-
-          <button
             onClick={handleExport}
             disabled={exportBusy}
             className="btn-ghost text-xs px-3 py-1.5"
@@ -595,7 +642,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
 
       {/* Audio player */}
       {detail.audio_path && (
-        <div className="px-6 py-2 border-b border-gray-800 flex items-center gap-3 no-print bg-gray-900/60">
+        <div className="px-6 py-2 border-b border-gray-800 flex items-center gap-3 bg-gray-900/60">
           <audio
             ref={audioRef}
             src={convertFileSrc(detail.audio_path)}
@@ -658,8 +705,8 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
       )}
 
       {/* Tabs */}
-      <div className="flex border-b border-gray-800 px-6 no-print" data-print-hide="">
-        {(["summary", "transcript", "actions", "notes", "chat"] as Tab[]).map((t) => (
+      <div className="flex border-b border-gray-800 px-6">
+        {(["summary", "transcript", "todo", "chat"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -669,8 +716,8 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
                 : "border-transparent text-gray-500 hover:text-gray-300"
             }`}
           >
-            {t}
-            {t === "actions" && actionItems.length > 0 && (
+            {t === "todo" ? "To-do" : t}
+            {t === "todo" && actionItems.length > 0 && (
               <span className="ml-1.5 text-xs bg-gray-700 text-gray-400 rounded-full px-1.5">
                 {actionItems.filter((a) => !a.done).length}
               </span>
@@ -685,38 +732,59 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
       </div>
 
       {/* Tab content */}
-      <div className="flex-1 overflow-y-auto p-6" id="print-content">
+      <div className="flex-1 overflow-y-auto p-6">
 
         {/* ----- Summary ----- */}
         {tab === "summary" && (
           <div className="space-y-4">
             {currentSummary ? (
               <>
-                <div className="flex justify-end items-center gap-3 no-print">
-                  {/* Send to note */}
-                  <button
-                    onClick={handleSendToNote}
-                    disabled={sendToNoteBusy}
-                    className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1.5 transition-colors disabled:opacity-40"
-                    title="Create a new note with this summary"
-                  >
-                    {sentToNote ? (
-                      <>
-                        <svg className="w-3.5 h-3.5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                        </svg>
-                        <span className="text-emerald-400">Sent!</span>
-                      </>
-                    ) : (
-                      <>
-                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
-                            d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                        </svg>
-                        Send to note
-                      </>
+                <div className="flex justify-end items-center gap-3">
+                  {/* Send to note dropdown */}
+                  <div className="relative" ref={sendToNotePickerRef}>
+                    <button
+                      onClick={() => setShowSendToNotePicker((v) => !v)}
+                      disabled={sendToNoteBusy}
+                      className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1.5 transition-colors disabled:opacity-40"
+                      title="Send summary to a note"
+                    >
+                      {sendToNoteBusy ? <Spinner /> : (
+                        <>
+                          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
+                              d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                          </svg>
+                          Send to note
+                        </>
+                      )}
+                    </button>
+                    {showSendToNotePicker && (
+                      <div className="absolute right-0 top-full mt-1 z-20 bg-gray-800 border border-gray-700 rounded-lg shadow-xl py-1 min-w-[200px] max-h-60 overflow-y-auto">
+                        <button
+                          onClick={() => handleSendToNote(null)}
+                          className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-700 flex items-center gap-2 border-b border-gray-700/60"
+                        >
+                          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                          </svg>
+                          New note
+                        </button>
+                        {allNotes.length === 0 ? (
+                          <p className="px-3 py-2 text-xs text-gray-600">No existing notes</p>
+                        ) : (
+                          allNotes.map((n) => (
+                            <button
+                              key={n.id}
+                              onClick={() => handleSendToNote(n.id)}
+                              className="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700 truncate block"
+                            >
+                              {n.title}
+                            </button>
+                          ))
+                        )}
+                      </div>
                     )}
-                  </button>
+                  </div>
 
                   {/* Copy */}
                   <button
@@ -749,7 +817,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
             )}
 
             {/* Resummary input */}
-            <div className="pt-4 border-t border-gray-800 flex gap-2 no-print">
+            <div className="pt-4 border-t border-gray-800 flex gap-2">
               <input
                 type="text"
                 value={resummaryInput}
@@ -782,7 +850,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
 
             {/* Version history */}
             {detail.summaries.length > 1 && (
-              <div className="pt-2 no-print">
+              <div className="pt-2">
                 <button
                   onClick={() => setShowVersions((v) => !v)}
                   className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
@@ -860,13 +928,13 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
           </div>
         )}
 
-        {/* ----- Actions ----- */}
-        {tab === "actions" && (
+        {/* ----- To-do ----- */}
+        {tab === "todo" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <p className="text-xs text-gray-500">
                 {actionItems.length === 0
-                  ? "No action items extracted yet."
+                  ? "No to-dos extracted yet."
                   : `${actionItems.filter((a) => !a.done).length} of ${actionItems.length} remaining`}
               </p>
               <button
@@ -919,75 +987,9 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
                       d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
                   </svg>
                 </div>
-                <p className="text-sm text-gray-600">Click "Extract from transcript" to find action items.</p>
+                <p className="text-sm text-gray-600">Click "Extract from transcript" to pull to-dos from the meeting.</p>
               </div>
             )}
-
-            {/* Linked notes */}
-            <div className="border-t border-gray-800 pt-4 mt-4">
-              <div className="flex items-center justify-between mb-3">
-                <p className="text-xs text-gray-500 uppercase tracking-widest font-medium">Linked Notes</p>
-                <div className="relative" ref={linkNotePickerRef}>
-                  <button
-                    onClick={() => setShowLinkNotePicker((v) => !v)}
-                    className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
-                  >
-                    + Link note
-                  </button>
-                  {showLinkNotePicker && (
-                    <div className="absolute right-0 top-full mt-1 z-20 bg-gray-800 border border-gray-700 rounded-lg shadow-xl py-1 min-w-[200px] max-h-48 overflow-y-auto">
-                      {allNotes.filter((n) => !linkedNotes.some((l) => l.id === n.id)).length === 0 ? (
-                        <p className="px-3 py-2 text-xs text-gray-600">No notes to link</p>
-                      ) : (
-                        allNotes
-                          .filter((n) => !linkedNotes.some((l) => l.id === n.id))
-                          .map((n) => (
-                            <button
-                              key={n.id}
-                              onClick={() => handleLinkNote(n.id)}
-                              className="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700 truncate"
-                            >
-                              {n.title}
-                            </button>
-                          ))
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-              {linkedNotes.length === 0 ? (
-                <p className="text-xs text-gray-700 italic">No notes linked to this recording.</p>
-              ) : (
-                <div className="space-y-1.5">
-                  {linkedNotes.map((note) => (
-                    <div key={note.id} className="flex items-center gap-2 group">
-                      <svg className="w-3 h-3 text-gray-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
-                          d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                      </svg>
-                      <span className="flex-1 text-xs text-gray-300 truncate">{note.title}</span>
-                      <button
-                        onClick={() => handleUnlinkNote(note.id)}
-                        className="opacity-0 group-hover:opacity-100 text-gray-700 hover:text-red-400 text-xs transition-opacity"
-                      >✕</button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ----- Notes ----- */}
-        {tab === "notes" && (
-          <div className="-m-6 h-full">
-            <NoteEditor
-              key={meetingId}
-              initialContent={detail.notes_content}
-              onSave={async (html) => {
-                await invoke("save_meeting_notes", { meetingId, content: html });
-              }}
-            />
           </div>
         )}
 
@@ -1025,7 +1027,7 @@ export default function MeetingView({ meetingId, onDeleted }: Props) {
               )}
               <div ref={chatEndRef} />
             </div>
-            <div className="flex gap-2 pt-2 border-t border-gray-800 shrink-0 no-print">
+            <div className="flex gap-2 pt-2 border-t border-gray-800 shrink-0">
               <input
                 type="text"
                 value={chatInput}

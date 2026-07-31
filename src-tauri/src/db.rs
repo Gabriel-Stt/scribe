@@ -270,6 +270,18 @@ pub fn get_chat_history(
 
 // --- Full transcript text ---
 
+pub fn get_meeting_title_and_text(
+    conn: &Connection,
+    meeting_id: &str,
+) -> Result<Option<(String, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT title, full_text FROM meetings WHERE id = ?1")?;
+    let result = stmt
+        .query_row(params![meeting_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
+    Ok(result)
+}
+
 pub fn get_full_text(conn: &Connection, meeting_id: &str) -> Result<Option<String>> {
     let mut stmt =
         conn.prepare("SELECT full_text FROM meetings WHERE id = ?1")?;
@@ -789,6 +801,37 @@ pub fn update_note_file_content(conn: &Connection, id: &str, content: &str) -> R
 pub fn delete_note_file(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+pub fn delete_note_file_if_empty(conn: &Connection, id: &str) -> Result<bool> {
+    let content: Option<String> = conn
+        .query_row(
+            "SELECT content FROM notes WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+
+    let is_empty = match &content {
+        None => true,
+        Some(html) => {
+            let mut in_tag = false;
+            let text: String = html.chars().filter(|&c| {
+                if c == '<' { in_tag = true; false }
+                else if c == '>' { in_tag = false; false }
+                else { !in_tag }
+            }).collect();
+            text.trim().is_empty()
+        }
+    };
+
+    if is_empty {
+        delete_note_file(conn, id)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 // --- Action items ---

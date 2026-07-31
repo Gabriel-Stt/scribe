@@ -942,6 +942,16 @@ pub async fn delete_note(state: State<'_, AppState>, note_id: String) -> Result<
     db::delete_note_file(&conn, &note_id).map_err(map_err)
 }
 
+#[tauri::command]
+pub async fn delete_note_if_empty(
+    state: State<'_, AppState>,
+    note_id: String,
+) -> Result<bool, String> {
+    let conn = state.db.lock().unwrap();
+    let deleted = db::delete_note_file_if_empty(&conn, &note_id).map_err(map_err)?;
+    Ok(deleted)
+}
+
 // ---- Action items ----------------------------------------------------------
 
 #[tauri::command]
@@ -1098,6 +1108,13 @@ pub async fn export_meeting_markdown(
     Ok(md)
 }
 
+// ---- Write file ------------------------------------------------------------
+
+#[tauri::command]
+pub async fn write_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| e.to_string())
+}
+
 // ---- Chat ------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -1152,6 +1169,58 @@ pub async fn send_chat_message(
         db::insert_chat_message(&conn, &args.meeting_id, "assistant", &response)
             .map_err(map_err)?;
     }
+
+    Ok(ChatResponse { response })
+}
+
+// ---- Standalone chat -------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Deserialize)]
+pub struct StandaloneChatArgs {
+    pub message: String,
+    pub meeting_ids: Vec<String>,
+    pub history: Vec<HistoryMessage>,
+}
+
+#[tauri::command]
+pub async fn send_standalone_chat(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    args: StandaloneChatArgs,
+) -> Result<ChatResponse, String> {
+    let data_dir = data_dir(&app).map_err(map_err)?;
+    let context_md = context_file::load_context(&data_dir);
+
+    let transcripts: Vec<(String, String)> = {
+        let conn = state.db.lock().unwrap();
+        args.meeting_ids
+            .iter()
+            .filter_map(|id| db::get_meeting_title_and_text(&conn, id).ok().flatten())
+            .collect()
+    };
+
+    let system_msg =
+        context_file::build_standalone_chat_system_message(&transcripts, &context_md);
+    let mut messages = vec![system_msg];
+    for h in &args.history {
+        messages.push(ChatMessage { role: h.role.clone(), content: h.content.clone() });
+    }
+    messages.push(ChatMessage::user(args.message.clone()));
+
+    let on_chunk = Arc::new({
+        let app = app.clone();
+        move |chunk: String| {
+            let _ = app.emit("standalone-chat-chunk", chunk);
+        }
+    });
+
+    let response = state.llm.chat_streaming(messages, on_chunk).await.map_err(map_err)?;
 
     Ok(ChatResponse { response })
 }

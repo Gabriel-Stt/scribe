@@ -2,11 +2,13 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { MeetingListItem, NoteFile, Folder, AppView, AppSettings, UserTag } from "../lib/types";
+import { ChatSession, loadChatSessions, deleteChatSession } from "../lib/chatStorage";
 import { formatTime } from "./shared";
 
 interface SidebarProps {
   view: AppView;
   onNavigate: (view: AppView) => void;
+  recordingPhase: string;
 }
 
 interface MeetingContextMenuState {
@@ -33,8 +35,8 @@ const TAG_COLORS = [
   "#06b6d4", "#6b7280",
 ];
 
-export default function Sidebar({ view, onNavigate }: SidebarProps) {
-  const [sidebarMode, setSidebarMode] = useState<"meetings" | "notes">("meetings");
+export default function Sidebar({ view, onNavigate, recordingPhase }: SidebarProps) {
+  const [sidebarMode, setSidebarMode] = useState<"meetings" | "notes" | "chat">("meetings");
 
   // ── Meetings state ─────────────────────────────────────────────────────────
   const [meetings, setMeetings] = useState<MeetingListItem[]>([]);
@@ -58,6 +60,9 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
   const [renamingNote, setRenamingNote] = useState<string | null>(null);
   const [renameNoteDraft, setRenameNoteDraft] = useState("");
   const noteContextMenuRef = useRef<HTMLDivElement>(null);
+
+  // ── Chat sessions state ────────────────────────────────────────────────────
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
 
   // ── Shared state ───────────────────────────────────────────────────────────
   const [search, setSearch] = useState("");
@@ -102,6 +107,10 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
     try { setAllTags(await invoke<UserTag[]>("list_tags")); } catch { /* ignore */ }
   }, []);
 
+  const reloadChatSessions = useCallback(() => {
+    setChatSessions(loadChatSessions());
+  }, []);
+
   // ── Initial loads ──────────────────────────────────────────────────────────
   useEffect(() => {
     invoke<AppSettings>("get_app_settings")
@@ -111,6 +120,7 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
 
   useEffect(() => { loadFolders(); }, [loadFolders]);
   useEffect(() => { loadAllTags(); }, [loadAllTags]);
+  useEffect(() => { reloadChatSessions(); }, [reloadChatSessions]);
   useEffect(() => { loadMeetings(search || undefined, selectedFolderId); }, [search, selectedFolderId, sortBy, loadMeetings]);
   useEffect(() => {
     if (sidebarMode === "notes") loadNotes(search || undefined, selectedFolderId);
@@ -133,6 +143,16 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
     window.addEventListener("scribe:reload-notes", h);
     return () => window.removeEventListener("scribe:reload-notes", h);
   }, [loadNotes, search]);
+
+  useEffect(() => {
+    window.addEventListener("scribe:reload-chats", reloadChatSessions);
+    return () => window.removeEventListener("scribe:reload-chats", reloadChatSessions);
+  }, [reloadChatSessions]);
+
+  // Auto-switch sidebar tab when navigating to a chat view
+  useEffect(() => {
+    if (view.kind === "chat") setSidebarMode("chat");
+  }, [view.kind]);
 
   // ── Context menu outside-click handlers ────────────────────────────────────
   useEffect(() => {
@@ -265,6 +285,14 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
     loadNotes(search || undefined);
   }
 
+  // ── Chat session actions ───────────────────────────────────────────────────
+  function handleDeleteChatSession(id: string) {
+    deleteChatSession(id);
+    if (view.kind === "chat" && view.sessionId === id) {
+      onNavigate({ kind: "chat", sessionId: null });
+    }
+  }
+
   // ── Folder actions ─────────────────────────────────────────────────────────
   async function handleCreateFolder() {
     if (!newFolderName.trim()) return;
@@ -345,25 +373,71 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
         </button>
       </div>
 
+      {/* Recording indicator — shown when recording away from a view that contains RecordView */}
+      {(recordingPhase === "recording" || recordingPhase === "paused") &&
+        view.kind !== "record" &&
+        !(view.kind === "split" && (view.left.kind === "record" || view.right.kind === "record")) && (
+        <div className="px-3 pb-2 shrink-0">
+          <button
+            onClick={() => onNavigate({ kind: "record" })}
+            className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium transition-colors ${
+              recordingPhase === "recording"
+                ? "bg-red-900/40 border border-red-800/60 text-red-300 hover:bg-red-900/60"
+                : "bg-yellow-900/40 border border-yellow-800/60 text-yellow-300 hover:bg-yellow-900/60"
+            }`}
+          >
+            <span className={`text-sm leading-none ${recordingPhase === "recording" ? "animate-pulse" : ""}`}>
+              {recordingPhase === "recording" ? "●" : "⏸"}
+            </span>
+            {recordingPhase === "recording" ? "Recording in progress" : "Recording paused"}
+            <svg className="w-3 h-3 ml-auto opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+        </div>
+      )}
+
       {/* New Recording button */}
-      <div className="px-3 pb-2 shrink-0">
+      <div className="px-3 pb-2 shrink-0 flex gap-2">
         <button
           onClick={() => onNavigate({ kind: "record" })}
-          className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+          className={`flex-1 flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
             view.kind === "record" ? "bg-indigo-600 text-white" : "bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300"
           }`}
         >
           <span className="text-base leading-none">●</span>
           New Recording
         </button>
+        <button
+          onClick={async () => {
+            try {
+              const note = await invoke<NoteFile>("create_note");
+              const title = `Notes — ${new Date().toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`;
+              await invoke("save_note", { args: { note_id: note.id, title, content: null } });
+              window.dispatchEvent(new Event("scribe:reload-notes"));
+              onNavigate({ kind: "split", left: { kind: "record" }, right: { kind: "note", id: note.id } });
+            } catch { /* ignore */ }
+          }}
+          title="Split screen — record and take notes simultaneously"
+          className={`flex items-center justify-center px-2.5 rounded-lg transition-colors ${
+            view.kind === "split" && view.left.kind === "record"
+              ? "bg-indigo-600 text-white"
+              : "bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300"
+          }`}
+        >
+          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
+              d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18M15 3v18" />
+          </svg>
+        </button>
       </div>
 
-      {/* Meetings / Notes toggle */}
+      {/* Meetings / Notes / Chat toggle */}
       <div className="px-3 pb-2 shrink-0">
         <div className="flex rounded-lg bg-gray-800/70 p-0.5 gap-0.5">
           <button
             onClick={() => setSidebarMode("meetings")}
-            className={`flex-1 text-[11px] py-1 rounded-md font-medium transition-colors ${
+            className={`flex-1 text-[10px] py-1 rounded-md font-medium transition-colors ${
               sidebarMode === "meetings" ? "bg-gray-700 text-gray-200 shadow-sm" : "text-gray-500 hover:text-gray-400"
             }`}
           >
@@ -371,11 +445,19 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
           </button>
           <button
             onClick={() => { setSidebarMode("notes"); loadNotes(search || undefined, selectedFolderId); }}
-            className={`flex-1 text-[11px] py-1 rounded-md font-medium transition-colors ${
+            className={`flex-1 text-[10px] py-1 rounded-md font-medium transition-colors ${
               sidebarMode === "notes" ? "bg-gray-700 text-gray-200 shadow-sm" : "text-gray-500 hover:text-gray-400"
             }`}
           >
             Notes
+          </button>
+          <button
+            onClick={() => setSidebarMode("chat")}
+            className={`flex-1 text-[10px] py-1 rounded-md font-medium transition-colors ${
+              sidebarMode === "chat" ? "bg-gray-700 text-gray-200 shadow-sm" : "text-gray-500 hover:text-gray-400"
+            }`}
+          >
+            Chat
           </button>
         </div>
       </div>
@@ -391,8 +473,8 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
         />
       </div>
 
-      {/* Folder navigation — shared between modes */}
-      <div className="px-2 pb-2 shrink-0">
+      {/* Folder navigation — shared between meetings and notes modes */}
+      <div className={`px-2 pb-2 shrink-0 ${sidebarMode === "chat" ? "hidden" : ""}`}>
         <div
           onClick={() => setSelectedFolderId(null)}
           onDragOver={(e) => handleFolderDragOver(e, "all")}
@@ -484,10 +566,23 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
         )}
       </div>
 
-      <div className="border-t border-gray-800 mx-3 mb-1 shrink-0" />
+      <div className={`border-t border-gray-800 mx-3 mb-1 shrink-0 ${sidebarMode === "chat" ? "hidden" : ""}`} />
 
-      {/* Sort controls (meetings) / New Note button (notes) */}
-      {sidebarMode === "meetings" ? (
+      {/* Sort controls (meetings) / New Note (notes) / New Chat (chat) */}
+      {sidebarMode === "chat" ? (
+        <div className="px-3 pb-1 shrink-0 flex items-center justify-between">
+          <span className="text-[10px] text-gray-600 uppercase tracking-widest">Chats</span>
+          <button
+            onClick={() => onNavigate({ kind: "chat", sessionId: null })}
+            title="New chat"
+            className="text-indigo-400 hover:text-indigo-300 transition-colors"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
+          </button>
+        </div>
+      ) : sidebarMode === "meetings" ? (
         <>
           <div className="px-3 pb-1 shrink-0 flex items-center gap-1.5">
             <span className="text-[10px] text-gray-600 uppercase tracking-widest">Sort</span>
@@ -672,6 +767,60 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
             })}
           </>
         )}
+
+        {/* ── Chat sessions list ────────────────────────────────────────── */}
+        {sidebarMode === "chat" && (
+          <>
+            {chatSessions.filter((s) => s.messages.length > 0).length === 0 && (
+              <div className="px-4 py-6 text-center">
+                <p className="text-xs text-gray-600 mb-3">No chats yet</p>
+                <button
+                  onClick={() => onNavigate({ kind: "chat", sessionId: null })}
+                  className="text-xs text-indigo-400 hover:text-indigo-300 border border-dashed border-indigo-800 hover:border-indigo-600 rounded-lg px-3 py-1.5 transition-colors"
+                >
+                  + New Chat
+                </button>
+              </div>
+            )}
+            {chatSessions
+              .filter((s) => s.messages.length > 0 && (!search || s.title.toLowerCase().includes(search.toLowerCase())))
+              .map((s) => {
+                const isActive = view.kind === "chat" && view.sessionId === s.id;
+                return (
+                  <div key={s.id} className="group relative">
+                    <button
+                      onClick={() => onNavigate({ kind: "chat", sessionId: s.id })}
+                      className={`w-full text-left px-3 py-2.5 border-b border-gray-800/60 transition-colors pr-7 ${
+                        isActive ? "bg-gray-800" : "hover:bg-gray-800/50"
+                      }`}
+                      style={isActive ? { borderLeft: "2px solid #6366f1" } : {}}
+                    >
+                      <p className="text-xs font-medium text-gray-200 leading-tight line-clamp-2">
+                        {s.title}
+                      </p>
+                      <div className="flex items-center gap-1.5 mt-1">
+                        <span className="text-[10px] text-gray-600">
+                          {formatChatDate(s.updatedAt)}
+                        </span>
+                        {s.contextMeetingIds.length > 0 && (
+                          <span className="text-[10px] text-indigo-600">
+                            {s.contextMeetingIds.length} meeting{s.contextMeetingIds.length > 1 ? "s" : ""}
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleDeleteChatSession(s.id); }}
+                      className="absolute top-2.5 right-2 opacity-0 group-hover:opacity-100 text-gray-700 hover:text-red-400 text-xs transition-opacity"
+                      title="Delete chat"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                );
+              })}
+          </>
+        )}
       </div>
 
       {/* Trash */}
@@ -818,6 +967,15 @@ export default function Sidebar({ view, onNavigate }: SidebarProps) {
 function formatDate(isoStr: string): string {
   try {
     const d = new Date(isoStr.replace(" ", "T") + "Z");
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  } catch {
+    return isoStr.slice(0, 10);
+  }
+}
+
+function formatChatDate(isoStr: string): string {
+  try {
+    const d = new Date(isoStr);
     return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
   } catch {
     return isoStr.slice(0, 10);

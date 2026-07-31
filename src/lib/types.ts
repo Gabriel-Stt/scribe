@@ -114,10 +114,18 @@ export interface NoteFile {
   updated_at: string;
 }
 
-export type AppView =
-  | { kind: "home" }
+export type SplitPanel =
   | { kind: "record" }
   | { kind: "meeting"; id: string }
   | { kind: "note"; id: string }
+  | { kind: "chat"; sessionId: string | null };
+
+export type AppView =
+  | { kind: "home" }
+  | { kind: "record" }
+  | { kind: "split"; left: SplitPanel; right: SplitPanel }
+  | { kind: "meeting"; id: string }
+  | { kind: "note"; id: string }
+  | { kind: "chat"; sessionId: string | null }
   | { kind: "settings" }
   | { kind: "trash" };

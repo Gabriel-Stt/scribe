@@ -92,6 +92,7 @@ pub fn run() {
             commands::create_meeting,
             commands::resummmarize,
             commands::send_chat_message,
+            commands::send_standalone_chat,
             commands::save_preference,
             commands::get_context,
             commands::save_context,
@@ -107,12 +108,14 @@ pub fn run() {
             commands::add_manual_note,
             commands::save_meeting_notes,
             commands::export_meeting_markdown,
+            commands::write_text_file,
             // Standalone notes
             commands::list_notes,
             commands::get_note,
             commands::create_note,
             commands::save_note,
             commands::delete_note,
+            commands::delete_note_if_empty,
             commands::assign_note_folder,
             // Action items
             commands::extract_action_items,
@@ -144,7 +147,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error building Tauri application")
         .run(|app_handle, event| {
-            if let tauri::RunEvent::Exit = event {
+            let should_cleanup = matches!(
+                event,
+                tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+            );
+            if should_cleanup {
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     if let Some(tx) = state.live_stop.lock().unwrap().take() {
                         let _ = tx.send(());
@@ -155,14 +162,28 @@ pub fn run() {
                         }
                     }
                 }
+                // Belt-and-suspenders: also kill by port in case the Child handle is stale.
+                kill_port_occupants(PARAKEET_PORT);
             }
         });
+}
+
+fn kill_port_occupants(port: u16) {
+    // Kill any stale process holding the port (e.g. sidecar left behind from a previous crash).
+    let _ = std::process::Command::new("sh")
+        .args([
+            "-c",
+            &format!("lsof -ti :{port} | xargs kill -9 2>/dev/null; true"),
+        ])
+        .status();
 }
 
 fn spawn_parakeet_sidecar(
     sidecar_dir: &str,
     port: u16,
 ) -> std::io::Result<std::process::Child> {
+    kill_port_occupants(port);
+
     let mut path = String::from("/opt/homebrew/bin:/usr/local/bin");
     if let Ok(home) = std::env::var("HOME") {
         path.push(':');

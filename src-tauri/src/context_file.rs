@@ -99,6 +99,47 @@ pub fn build_chat_system_message(transcript: &str) -> ChatMessage {
     ChatMessage::system(format!("{CHAT_SYSTEM_PROMPT}\n\nTranscript:\n{transcript}"))
 }
 
+const STANDALONE_CHAT_PROMPT: &str = "\
+You are a helpful AI assistant built into Scribe, a local meeting recorder app. \
+You can answer general questions and, when meeting transcripts are provided, \
+answer questions about those specific recordings.
+
+When meeting transcripts are provided:
+1. Look for the answer directly in the transcript(s).
+2. Reason from closely related content where it is natural to do so.
+3. Never invent specific facts (numbers, names, dates) not grounded in the transcripts.
+
+For questions unrelated to any meeting, answer helpfully and concisely.";
+
+pub fn build_standalone_chat_system_message(
+    transcripts: &[(String, String)],
+    context_md: &str,
+) -> ChatMessage {
+    let mut system = STANDALONE_CHAT_PROMPT.to_string();
+
+    if !context_md.trim().is_empty() {
+        system.push_str("\n\n--- USER PREFERENCES ---\n");
+        system.push_str(context_md.trim());
+        system.push_str("\n--- END USER PREFERENCES ---");
+    }
+
+    if !transcripts.is_empty() {
+        system.push_str("\n\n--- MEETING TRANSCRIPTS ---");
+        for (title, text) in transcripts {
+            if text.trim().is_empty() {
+                system.push_str(&format!(
+                    "\n\n## {title}\n\n[No transcript available for this meeting yet.]"
+                ));
+            } else {
+                system.push_str(&format!("\n\n## {title}\n\n{text}"));
+            }
+        }
+        system.push_str("\n\n--- END MEETING TRANSCRIPTS ---");
+    }
+
+    ChatMessage::system(system)
+}
+
 pub fn build_title_messages(transcript_excerpt: &str) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(

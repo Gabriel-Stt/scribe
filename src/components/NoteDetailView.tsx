@@ -24,9 +24,10 @@ interface Props {
   noteId: string;
   onDeleted: () => void;
   onNavigate: (view: AppView) => void;
+  compact?: boolean;
 }
 
-export default function NoteDetailView({ noteId, onDeleted, onNavigate }: Props) {
+export default function NoteDetailView({ noteId, onDeleted, onNavigate, compact }: Props) {
   const [note, setNote] = useState<NoteFile | null>(null);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [titleDraft, setTitleDraft] = useState("");
@@ -217,8 +218,8 @@ export default function NoteDetailView({ noteId, onDeleted, onNavigate }: Props)
       </div>
 
       {/* Editor + linked meetings */}
-      <div className="flex flex-1 overflow-hidden">
-        <div className="flex-1 overflow-hidden">
+      <div className={`flex flex-1 overflow-hidden`}>
+        <div className="flex-1 overflow-hidden min-w-0">
           <NoteEditor
             key={note.id}
             initialContent={note.content}
@@ -230,8 +231,8 @@ export default function NoteDetailView({ noteId, onDeleted, onNavigate }: Props)
           />
         </div>
 
-        {/* Linked meetings sidebar */}
-        <div className="w-48 shrink-0 border-l border-gray-800 flex flex-col py-4 overflow-hidden">
+        {/* Linked meetings sidebar — hidden in compact/split mode */}
+        {!compact && <div className="w-48 shrink-0 border-l border-gray-800 flex flex-col py-4 overflow-hidden min-w-0">
           <div className="flex items-center justify-between px-3 mb-2">
             <span className="text-[10px] text-gray-600 uppercase tracking-widest font-medium">Meetings</span>
             <div className="relative" ref={linkMeetingPickerRef}>
@@ -268,16 +269,16 @@ export default function NoteDetailView({ noteId, onDeleted, onNavigate }: Props)
             ) : (
               <div className="space-y-1">
                 {linkedMeetings.map((m) => (
-                  <div key={m.id} className="group relative rounded-lg hover:bg-gray-800/60 transition-colors">
+                  <div key={m.id} className="group relative rounded-lg hover:bg-gray-800/60 transition-colors overflow-hidden">
                     <button
                       onClick={() => onNavigate({ kind: "meeting", id: m.id })}
-                      className="w-full text-left px-2 py-2 pr-6"
+                      className="w-full text-left px-2 py-2 pr-6 overflow-hidden min-w-0"
                     >
-                      <p className="text-xs text-gray-300 leading-snug truncate">{m.title}</p>
+                      <p className="text-xs text-gray-300 leading-snug truncate w-full">{m.title}</p>
                       <p className="text-[10px] text-gray-600 mt-0.5">{formatDate(m.created_at)}</p>
                     </button>
                     <button
-                      onClick={() => handleUnlinkMeeting(m.id)}
+                      onClick={(e) => { e.stopPropagation(); handleUnlinkMeeting(m.id); }}
                       className="absolute right-1.5 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 text-xs transition-opacity"
                     >✕</button>
                   </div>
@@ -285,7 +286,7 @@ export default function NoteDetailView({ noteId, onDeleted, onNavigate }: Props)
               </div>
             )}
           </div>
-        </div>
+        </div>}
       </div>
     </div>
   );

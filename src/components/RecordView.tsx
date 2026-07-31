@@ -14,7 +14,11 @@ type Phase = "idle" | "recording" | "paused" | "transcribing" | "saving" | "done
 
 export default function RecordView({ onMeetingReady }: RecordViewProps) {
   const [status, setStatus] = useState<StatusResponse | null>(null);
-  const [phase, setPhase] = useState<Phase>("idle");
+  const [phase, setPhaseRaw] = useState<Phase>("idle");
+  function setPhase(p: Phase) {
+    setPhaseRaw(p);
+    window.dispatchEvent(new CustomEvent("scribe:phase-change", { detail: p }));
+  }
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [_audioPath, setAudioPath] = useState<string | null>(null);
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
